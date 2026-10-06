@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /* =====================================================================
-   MOBI-SERVER v2 · multidispositivo
+   MOBI-SERVER v4 · multidispositivo
    - Sirve la app (index.html) y la API desde el mismo servicio (Render).
    - /api/bus*      : puente en tiempo real entre dispositivos (chat, GPS, viajes, registro…)
    - /api/trip/*    : adjudicación atómica de viajes (el primer conductor que lo toma se lo queda)
@@ -51,7 +51,7 @@ app.get(['/', '/index.html'], (_req, res) => {
 const rooms = new Map();
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'MOBI-SERVER', version: 3, mercadoPagoConfigured: Boolean(MP_ACCESS_TOKEN), adminConfigured: Boolean(ADMIN_KEY), whatsappConfigured: Boolean(WA_NUMBER), rooms: rooms.size, uptime: Math.round(process.uptime()) });
+  res.json({ ok: true, service: 'MOBI-SERVER', version: 4, mercadoPagoConfigured: Boolean(MP_ACCESS_TOKEN), adminConfigured: Boolean(ADMIN_KEY), whatsappConfigured: Boolean(WA_NUMBER), rooms: rooms.size, uptime: Math.round(process.uptime()) });
 });
 app.get('/api/config', (_req, res) => {
   res.json({ ok: true, mpPublicKey: MP_PUBLIC_KEY, mpEnabled: Boolean(MP_ACCESS_TOKEN), serverTime: Date.now() });
@@ -183,7 +183,7 @@ app.get('/api/gps/:id', (req, res) => {
 /* ------------- Mercado Pago · Checkout API Orders (tarjeta) -------------
    Pago al pedir el viaje: crédito = reserva (capture_mode manual) → /capture al finalizar,
    /cancel si se cancela. Débito se cobra en el momento. Access Token solo en el servidor. */
-const MP_API = 'https://api.mercadopago.com';
+const MP_API = process.env.MP_API_BASE || 'https://api.mercadopago.com';
 const mpHeaders = (idem) => ({
   'Content-Type': 'application/json',
   'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
@@ -215,8 +215,8 @@ app.post('/api/mercadopago/pay', async (req, res) => {
   const captureMode = type === 'credit_card' ? 'manual' : 'automatic';
   const reference = cleanRef(b.externalReference);
   const amountStr = amount.toFixed(2);
-  const payer = { email: String((b.payer && b.payer.email) || b.payerEmail || 'test@testuser.com') };
-  if (b.payer && b.payer.identification && b.payer.identification.number) {
+  const payer = b.customerId ? { customer_id: String(b.customerId) } : { email: String((b.payer && b.payer.email) || b.payerEmail || 'test@testuser.com') };
+  if (!b.customerId && b.payer && b.payer.identification && b.payer.identification.number) {
     payer.identification = { type: String(b.payer.identification.type || 'DNI'), number: String(b.payer.identification.number) };
   }
   const payload = {
@@ -319,6 +319,72 @@ app.post('/api/admin/check', (req, res) => {
   adminTokens.delete(t); res.status(401).json({ ok: false });
 });
 
+/* ---------------- tarjetas guardadas (Mercado Pago Customers) ----------------
+   El número de tarjeta nunca pasa por MOBI: la app lo tokeniza con Mercado Pago y acá solo se guarda el token
+   en el "customer" del pasajero. Cada customer queda atado al DNI del perfil (description = mobi:dni:<DNI>). */
+const dniOf = (v) => String(v || '').replace(/\D/g, '').slice(0, 9);
+const okEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || ''));
+async function findCustomer(email) {
+  const r = await mpCall('GET', `/v1/customers/search?email=${encodeURIComponent(email)}`);
+  const c = r.ok && r.data && Array.isArray(r.data.results) ? r.data.results[0] : null;
+  return c || null;
+}
+const cardView = (c) => ({
+  id: c.id, last4: c.last_four_digits, firstSix: c.first_six_digits,
+  brand: (c.payment_method && (c.payment_method.name || c.payment_method.id)) || 'Tarjeta',
+  methodId: c.payment_method && c.payment_method.id, typeId: c.payment_method && c.payment_method.payment_type_id,
+  thumb: c.payment_method && (c.payment_method.secure_thumbnail || c.payment_method.thumbnail),
+  exp: c.expiration_month && c.expiration_year ? `${String(c.expiration_month).padStart(2, '0')}/${String(c.expiration_year).slice(-2)}` : '',
+  holder: c.cardholder && c.cardholder.name
+});
+function cardsGuard(req, res) {
+  if (needMp(res)) return null;
+  const b = req.body || {}, email = String(b.email || '').trim().toLowerCase(), dni = dniOf(b.dni);
+  if (!okEmail(email)) { res.status(400).json({ ok: false, error: 'email_required' }); return null; }
+  if (dni.length < 6) { res.status(400).json({ ok: false, error: 'dni_required' }); return null; }
+  return { b, email, dni };
+}
+const ownedBy = (c, dni) => !c.description || c.description === `mobi:dni:${dni}`;
+
+app.post('/api/mp/cards', async (req, res) => {
+  const g = cardsGuard(req, res); if (!g) return;
+  try {
+    const c = await findCustomer(g.email);
+    if (!c) return res.json({ ok: true, customerId: null, cards: [] });
+    if (!ownedBy(c, g.dni)) return res.status(403).json({ ok: false, error: 'not_owner' });
+    const r = await mpCall('GET', `/v1/customers/${encodeURIComponent(c.id)}/cards`);
+    res.json({ ok: true, customerId: c.id, cards: (r.ok && Array.isArray(r.data) ? r.data : []).map(cardView) });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+app.post('/api/mp/cards/add', async (req, res) => {
+  const g = cardsGuard(req, res); if (!g) return;
+  if (!g.b.token) return res.status(400).json({ ok: false, error: 'token_required' });
+  try {
+    let c = await findCustomer(g.email);
+    if (c && !ownedBy(c, g.dni)) return res.status(403).json({ ok: false, error: 'not_owner' });
+    if (!c) {
+      const full = String(g.b.name || '').trim().split(/\s+/);
+      const r = await mpCall('POST', '/v1/customers', { email: g.email, first_name: full[0] || undefined, last_name: full.slice(1).join(' ') || undefined,
+        identification: { type: 'DNI', number: g.dni }, description: `mobi:dni:${g.dni}` });
+      if (!r.ok) return res.status(r.status).json({ ok: false, error: 'customer_failed', details: r.data });
+      c = r.data;
+    }
+    const r2 = await mpCall('POST', `/v1/customers/${encodeURIComponent(c.id)}/cards`, { token: String(g.b.token) });
+    if (!r2.ok) return res.status(r2.status).json({ ok: false, error: 'card_failed', details: r2.data });
+    res.status(201).json({ ok: true, customerId: c.id, card: cardView(r2.data) });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+app.post('/api/mp/cards/remove', async (req, res) => {
+  const g = cardsGuard(req, res); if (!g) return;
+  try {
+    const c = await findCustomer(g.email);
+    if (!c) return res.status(404).json({ ok: false, error: 'not_found' });
+    if (!ownedBy(c, g.dni)) return res.status(403).json({ ok: false, error: 'not_owner' });
+    const r = await mpCall('DELETE', `/v1/customers/${encodeURIComponent(c.id)}/cards/${encodeURIComponent(String(g.b.cardId || ''))}`);
+    res.status(r.ok ? 200 : r.status).json({ ok: r.ok });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+
 /* ---------------- verificación de teléfono por WhatsApp ----------------
    1) La app pide un código (POST /api/wa/start) y abre un chat de WhatsApp con el número de MOBI y el código escrito.
    2) El usuario lo envía; Meta avisa a este servidor (POST /api/wa/webhook).
@@ -379,4 +445,4 @@ app.post('/api/wa/webhook', (req, res) => {
   } catch (e) { console.warn('WA webhook', e.message); }
 });
 
-app.listen(PORT, () => console.log(`MOBI-SERVER v3 escuchando en el puerto ${PORT}`));
+app.listen(PORT, () => console.log(`MOBI-SERVER v4 escuchando en el puerto ${PORT}`));
