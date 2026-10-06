@@ -86,7 +86,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -164,6 +164,7 @@ app.post('/api/bus/batch', (req, res) => {
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
     if (m && m.type === 'acct-susp') continue;   // solo el administrador (endpoint propio)
+    if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
       const a = m.data.active, k = a.tripKey, claim = k ? r.claims.get(k) : null;
       const drvId = a.driver && a.driver.id;
@@ -177,7 +178,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && m.type === 'acct-susp') return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
   res.json({ ok: true, id: saved.id });
@@ -612,6 +613,17 @@ async function docsOf(owner) {
   return out;
 }
 function adminOk(t) { const exp = adminTokens.get(String(t || '')); return !!(exp && exp > Date.now()); }
+
+/* V352 · aprobar / rechazar cambios de datos de un pasajero · solo administrador */
+app.post('/api/admin/paxchg', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  const id = String(b.id || ''), status = b.status === 'aprobado' ? 'aprobado' : b.status === 'rechazado' ? 'rechazado' : '';
+  if (!/^pax_[a-z0-9]{3,20}$/.test(id) || !status) return res.status(400).json({ ok: false, error: 'datos' });
+  const data = { id, rid: String(b.rid || '').slice(0, 40), status, reason: String(b.reason || '').slice(0, 200), at: Date.now() };
+  const saved = pushMessage(getRoom(b.room), { type: 'pax-chg', key: 'pc:' + id, src: 'admin', data });
+  res.json({ ok: true, data, id: saved && saved.id });
+});
 
 /* V351 · suspender / reactivar una cuenta (por los últimos 8 dígitos del celular) · solo administrador */
 app.post('/api/admin/suspend', (req, res) => {
