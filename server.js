@@ -86,7 +86,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -163,6 +163,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
+    if (m && m.type === 'acct-susp') continue;   // solo el administrador (endpoint propio)
     if (m && m.type === 'trip' && m.data && m.data.active) {
       const a = m.data.active, k = a.tripKey, claim = k ? r.claims.get(k) : null;
       const drvId = a.driver && a.driver.id;
@@ -176,6 +177,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
+  if (m && m.type === 'acct-susp') return res.status(403).json({ ok: false, error: 'admin' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
   res.json({ ok: true, id: saved.id });
@@ -583,6 +585,96 @@ app.post('/api/wa/webhook', (req, res) => {
     }
   } catch (e) { console.warn('WA webhook', e.message); }
 });
+
+
+/* ---------------- fotos de documentos (conductores y vehículos) ----------------
+   El conductor sube cada foto una vez al enviar a evaluación. Solo el administrador (con su token) puede verlas,
+   y el propio dueño cuando recupera su cuenta con WhatsApp. */
+const DOC_KINDS = new Set(['cedula', 'license', 'dniF', 'dniB', 'profile']);
+const docMem = new Map();                                        // owner|kind -> { img, at }  (respaldo si no hay base)
+const okOwner = (o) => /^(drv_[a-z0-9]{3,20}|car:drv_[a-z0-9]{3,20}:[A-Z0-9]{5,8})$/.test(String(o || ''));
+app.post('/api/docs/put', async (req, res) => {
+  const b = req.body || {}, owner = String(b.owner || ''), kind = String(b.kind || ''), img = String(b.img || '');
+  if (!okOwner(owner) || !DOC_KINDS.has(kind)) return res.status(400).json({ ok: false, error: 'bad_owner_or_kind' });
+  if (!/^data:image\/(jpeg|png|webp);base64,/.test(img) || img.length > 1_600_000) return res.status(400).json({ ok: false, error: 'bad_image' });
+  const id = owner + '|' + kind, item = { img, at: Date.now() };
+  docMem.set(id, item); if (docMem.size > 400) docMem.delete(docMem.keys().next().value);
+  await kvSet('doc', id, item);
+  res.json({ ok: true });
+});
+async function docsOf(owner) {
+  const out = {};
+  if (db) {
+    try { const r = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'doc' AND id LIKE $1`, [owner + '|%']); for (const row of r.rows) out[row.id.split('|')[1]] = row.data.img; }
+    catch (e) { console.warn('docs', e.message); }
+  }
+  for (const [id, v] of docMem) if (id.startsWith(owner + '|') && !out[id.split('|')[1]]) out[id.split('|')[1]] = v.img;
+  return out;
+}
+function adminOk(t) { const exp = adminTokens.get(String(t || '')); return !!(exp && exp > Date.now()); }
+
+/* V351 · suspender / reactivar una cuenta (por los últimos 8 dígitos del celular) · solo administrador */
+app.post('/api/admin/suspend', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  const tail = String(b.tail || '').replace(/\D/g, '').slice(-8);
+  if (tail.length < 6) return res.status(400).json({ ok: false, error: 'celular' });
+  const data = {
+    tail, susp: !!b.susp, reason: String(b.reason || '').slice(0, 300), name: String(b.name || '').slice(0, 80),
+    ids: Array.isArray(b.ids) ? b.ids.slice(0, 10).map(x => String(x).slice(0, 40)) : [], at: Date.now()
+  };
+  const saved = pushMessage(getRoom(b.room), { type: 'acct-susp', key: 'su:' + tail, src: 'admin', data });
+  console.log('Cuenta ' + (data.susp ? 'SUSPENDIDA' : 'reactivada') + ' · …' + tail.slice(-4));
+  res.json({ ok: true, data, id: saved && saved.id });
+});
+app.post('/api/docs/get', async (req, res) => {
+  const b = req.body || {}, owner = String(b.owner || '');
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin_only' });
+  if (!okOwner(owner)) return res.status(400).json({ ok: false, error: 'bad_owner' });
+  res.json({ ok: true, docs: await docsOf(owner) });
+});
+
+/* ---------------- recuperar cuenta (celular nuevo o app reinstalada) ----------------
+   Requiere haber verificado el número por WhatsApp en los últimos 30 minutos.
+   Busca los registros de pasajero y conductor con ese mismo número. */
+app.post('/api/account/find', async (req, res) => {
+  const userId = String((req.body && req.body.userId) || '').slice(0, 60), v = waVerified.get(userId);
+  if (!v || Date.now() - (v.at || 0) > 30 * 60_000) return res.status(403).json({ ok: false, error: 'verify_first' });
+  let pax = null, drv = null;
+  for (const room of rooms.values()) for (const m of room.sticky.values()) {
+    const d = m && m.data; if (!d || typeof d !== 'object') continue;
+    if (tail8(d.phone) !== v.tail) continue;
+    const when = Number(d.upd || d.updatedAt || m.at || 0);
+    if (m.type === 'pax-reg' && (!pax || when > pax._w)) pax = Object.assign({}, d, { _w: when });
+    if (m.type === 'driver-reg' && !d.hiddenAt && (!drv || when > drv._w)) drv = Object.assign({}, d, { _w: when });
+  }
+  let drvDocs = null;
+  if (drv && drv.id) drvDocs = await docsOf(drv.id);
+  if (pax) delete pax._w; if (drv) delete drv._w;
+  console.log('Recuperar cuenta · …' + v.tail.slice(-4), pax ? 'pasajero' : '', drv ? 'conductor' : '');
+  res.json({ ok: true, pax, drv, drvDocs });
+});
+
+/* ---------------- limpieza: registros de pasajeros nunca verificados (90 días) ----------------
+   Ley 25.326: los datos se guardan solo mientras hagan falta. Se borran los pasajeros que en 90 días
+   nunca verificaron su WhatsApp ni hicieron un viaje. */
+async function purgeUnverified() {
+  const limit = Date.now() - 90 * 86400_000; let n = 0;
+  for (const room of rooms.values()) {
+    const trips = [...room.sticky.values()].filter((m) => m && (m.type === 'trip-done' || m.type === 'trip-end')).map((m) => JSON.stringify(m.data || ''));
+    for (const [k, m] of [...room.sticky.entries()]) {
+      if (!m || m.type !== 'pax-reg') continue;
+      const d = m.data || {}, born = Number(d.at || m.at || Date.now());
+      if (d.wa || waVerified.has(d.id) || born > limit) continue;
+      if (d.id && trips.some((t) => t.includes(d.id))) continue;
+      room.sticky.delete(k); n++;
+      if (db) { try { await db.query('DELETE FROM mobi_sticky WHERE room = $1 AND k = $2', [room.name, k]); } catch (e) { console.warn('purga', e.message); } }
+    }
+  }
+  if (n) console.log('Limpieza 90 días: se borraron ' + n + ' registros de pasajeros sin verificar');
+}
+setTimeout(purgeUnverified, 60_000).unref();
+setInterval(purgeUnverified, 6 * 3600_000).unref();
 
 await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
