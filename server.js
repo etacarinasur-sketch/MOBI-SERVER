@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /* =====================================================================
-   MOBI-SERVER v4 · multidispositivo
+   MOBI-SERVER v5 · multidispositivo
    - Sirve la app (index.html) y la API desde el mismo servicio (Render).
    - /api/bus*      : puente en tiempo real entre dispositivos (chat, GPS, viajes, registro…)
    - /api/trip/*    : adjudicación atómica de viajes (el primer conductor que lo toma se lo queda)
@@ -50,8 +50,78 @@ app.get(['/', '/index.html'], (_req, res) => {
 
 const rooms = new Map();
 
+/* ---------------- BASE DE DATOS (Neon / Postgres) ----------------
+   Si existe la variable DATABASE_URL, todo lo importante se guarda en la base:
+   mensajes "fijos" del bus (registros de pasajeros y conductores, pagos y retiros, estado de viajes)
+   y las verificaciones de WhatsApp. Si no hay base, el servidor sigue funcionando en memoria. */
+const DATABASE_URL = String(process.env.DATABASE_URL || '').trim()
+  .replace(/([?&])channel_binding=[^&]*&?/, '$1').replace(/[?&]$/, '');   // Neon agrega channel_binding: node-postgres no lo necesita
+let db = null, dbState = DATABASE_URL ? 'starting' : 'off', dbError = '';
+const dirty = new Map();
+let flushing = false;
+async function dbInit() {
+  if (!DATABASE_URL) return;
+  try {
+    const mod = await import('pg');
+    const pg = mod.default || mod;
+    db = new pg.Pool({ connectionString: DATABASE_URL, ssl: /localhost|127\.0\.0\.1/.test(DATABASE_URL) ? false : { rejectUnauthorized: false }, max: 3, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 20_000 });
+    db.on('error', (e) => { dbError = e.message; });
+    await db.query(`CREATE TABLE IF NOT EXISTS mobi_sticky (room text NOT NULL, k text NOT NULL, msg jsonb NOT NULL, at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (room, k))`);
+    await db.query(`CREATE TABLE IF NOT EXISTS mobi_kv (ns text NOT NULL, id text NOT NULL, data jsonb NOT NULL, at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (ns, id))`);
+    await db.query(`DELETE FROM mobi_sticky WHERE (k LIKE 'trip%' AND at < now() - interval '3 days') OR k LIKE 'pax-pos%' OR k LIKE 'driver-pos%' OR k LIKE 'approach-route%'`);
+    const r = await db.query('SELECT room, k, msg FROM mobi_sticky');
+    for (const row of r.rows) {
+      const room = getRoom(row.room), msg = row.msg;
+      room.sticky.set(row.k, msg);
+      if (Number(msg.id) > room.seq) room.seq = Number(msg.id);
+    }
+    const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
+    for (const row of w.rows) waVerified.set(row.id, row.data);
+    dbState = 'on';
+    console.log(`Base de datos conectada: ${r.rows.length} registros, ${w.rows.length} verificaciones`);
+  } catch (e) {
+    dbState = 'error'; dbError = e.message; db = null;
+    console.warn('No se pudo conectar la base de datos (sigo en memoria):', e.message);
+  }
+}
+/* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
+   (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done']);
+const dirtySlow = new Map();
+function persistSticky(roomName, k, msg) {
+  if (!db) return;
+  const item = { room: roomName, k, msg }, key = roomName + '\u0001' + k;
+  if (DURABLE.has(msg.type)) dirty.set(key, item);
+  else if (msg.type === 'trip') dirtySlow.set(key, item);
+}
+setInterval(() => { for (const [k, v] of dirtySlow) dirty.set(k, v); dirtySlow.clear(); }, 20_000).unref();
+async function flushSticky() {
+  if (!db || flushing || !dirty.size) return;
+  flushing = true;
+  const items = [...dirty.values()]; dirty.clear();
+  try {
+    for (let i = 0; i < items.length; i += 40) {
+      const chunk = items.slice(i, i + 40), vals = [], args = [];
+      chunk.forEach((it, j) => { vals.push(`($${j * 3 + 1}, $${j * 3 + 2}, $${j * 3 + 3}::jsonb, now())`); args.push(it.room, it.k, JSON.stringify(it.msg)); });
+      await db.query(`INSERT INTO mobi_sticky (room, k, msg, at) VALUES ${vals.join(',')} ON CONFLICT (room, k) DO UPDATE SET msg = EXCLUDED.msg, at = now()`, args);
+    }
+    dbError = '';
+  } catch (e) {
+    dbError = e.message;
+    for (const it of items) { const key = it.room + '\u0001' + it.k; if (!dirty.has(key)) dirty.set(key, it); }
+    console.warn('Error guardando en la base:', e.message);
+  }
+  flushing = false;
+}
+setInterval(flushSticky, 1000).unref();
+async function kvSet(ns, id, data) {
+  if (!db) return;
+  try { await db.query(`INSERT INTO mobi_kv (ns, id, data, at) VALUES ($1, $2, $3::jsonb, now()) ON CONFLICT (ns, id) DO UPDATE SET data = EXCLUDED.data, at = now()`, [ns, String(id), JSON.stringify(data)]); }
+  catch (e) { dbError = e.message; console.warn('kv', e.message); }
+}
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'MOBI-SERVER', version: 4, mercadoPagoConfigured: Boolean(MP_ACCESS_TOKEN), adminConfigured: Boolean(ADMIN_KEY), whatsappConfigured: Boolean(WA_NUMBER), rooms: rooms.size, uptime: Math.round(process.uptime()) });
+  res.json({ ok: true, service: 'MOBI-SERVER', version: 5, database: dbState, databaseError: dbState === 'on' ? undefined : (dbError || undefined), mercadoPagoConfigured: Boolean(MP_ACCESS_TOKEN), adminConfigured: Boolean(ADMIN_KEY), whatsappConfigured: Boolean(WA_NUMBER), rooms: rooms.size, uptime: Math.round(process.uptime()) });
 });
 app.get('/api/config', (_req, res) => {
   res.json({ ok: true, mpPublicKey: MP_PUBLIC_KEY, mpEnabled: Boolean(MP_ACCESS_TOKEN), serverTime: Date.now() });
@@ -83,7 +153,7 @@ function pushMessage(room, m) {
   };
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
-  if (msg.key) room.sticky.set(msg.type + '|' + msg.key, msg);
+  if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
   return msg;
 }
 
@@ -438,11 +508,14 @@ app.post('/api/wa/webhook', (req, res) => {
         const code = 'MOBI-' + mm[1], p = waPending.get(code);
         if (!p) { waReply(m.from, 'Ese código venció o no existe. Pedí uno nuevo desde la app de MOBI.'); continue; }
         if (tail8(m.from) !== p.tail) { waReply(m.from, 'Este número no coincide con el que cargaste en MOBI.'); continue; }
-        waPending.delete(code); waVerified.set(p.userId, { tail: p.tail, at: Date.now() });
+        waPending.delete(code); waVerified.set(p.userId, { tail: p.tail, at: Date.now() }); kvSet('wa', p.userId, { tail: p.tail, at: Date.now() });
         waReply(m.from, '✅ Número verificado. Ya podés volver a MOBI.');
       }
     }
   } catch (e) { console.warn('WA webhook', e.message); }
 });
 
-app.listen(PORT, () => console.log(`MOBI-SERVER v4 escuchando en el puerto ${PORT}`));
+await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
+app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
+/* al apagar, guardar lo pendiente */
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { try { for (const [k, v] of dirtySlow) dirty.set(k, v); await flushSticky(); } catch (e) {} process.exit(0); });
