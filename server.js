@@ -488,9 +488,19 @@ async function waRegister() {                                   // error 133010:
     });
     const t = (await r.text()).slice(0, 300);
     console.log('WA register', r.status, t);
+    if (r.ok) await waSubscribe();
     return r.ok;
   } catch (e) { console.warn('WA register', e.message); return false; }
 }
+const WA_WABA_ID = String(process.env.WA_WABA_ID || (WA_PHONE_ID === '1459329300586126' ? '2099638707344052' : '')).replace(/\D/g, '');
+async function waSubscribe() {                                  // conecta la cuenta de WhatsApp de MOBI con la app (si no, Meta no avisa los mensajes)
+  if (!WA_TOKEN || !WA_WABA_ID) return;
+  try {
+    const r = await fetch(`https://graph.facebook.com/v20.0/${WA_WABA_ID}/subscribed_apps`, { method: 'POST', headers: { Authorization: `Bearer ${WA_TOKEN}` } });
+    console.log('WA subscribe', r.status, (await r.text()).slice(0, 200));
+  } catch (e) { console.warn('WA subscribe', e.message); }
+}
+setTimeout(waSubscribe, 5000);
 async function waOpenTestChat(phone, again) {
   const e = waE164AR(phone);
   if (!WA_IS_TEST || !WA_TOKEN || !WA_PHONE_ID || !e) return;
@@ -533,12 +543,20 @@ app.get('/api/wa/webhook', (req, res) => {
 });
 async function waReply(to, body) {
   if (!WA_TOKEN || !WA_PHONE_ID) return;
-  try {
-    await fetch(`https://graph.facebook.com/v20.0/${encodeURIComponent(WA_PHONE_ID)}/messages`, {
-      method: 'POST', headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } })
-    });
-  } catch (e) { console.warn('WA reply', e.message); }
+  const d = String(to || '').replace(/\D/g, '');
+  const cands = [d];
+  if (/^549\d{10}$/.test(d)) { const n = d.slice(3); cands.push('54' + n, '54' + n.slice(0, 2) + '15' + n.slice(2), '54' + n.slice(0, 3) + '15' + n.slice(3), '54' + n.slice(0, 4) + '15' + n.slice(4)); }
+  for (const t of [...new Set(cands)]) {
+    try {
+      const r = await fetch(`https://graph.facebook.com/v20.0/${encodeURIComponent(WA_PHONE_ID)}/messages`, {
+        method: 'POST', headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to: t, type: 'text', text: { body } })
+      });
+      const x = (await r.text()).slice(0, 200);
+      console.log('WA reply', t, r.status, r.ok ? '' : x);
+      if (r.ok || !/131030|recipient/i.test(x)) return;      // solo se reintenta si el problema es el formato del número
+    } catch (e) { console.warn('WA reply', e.message); return; }
+  }
 }
 app.post('/api/wa/webhook', (req, res) => {
   if (WA_APP_SECRET) {
@@ -549,11 +567,14 @@ app.post('/api/wa/webhook', (req, res) => {
   }
   res.sendStatus(200);                                                    // Meta exige responder rápido
   try {
+    const n = ((req.body && req.body.entry) || []).reduce((a, en) => a + (en.changes || []).reduce((b, ch) => b + ((ch.value && ch.value.messages) || []).length, 0), 0);
+    console.log('WA webhook recibido · mensajes:', n);
     for (const en of (req.body && req.body.entry) || []) for (const ch of en.changes || []) {
       for (const m of (ch.value && ch.value.messages) || []) {
         const text = String((m.text && m.text.body) || '');
         const mm = text.match(/MOBI[-\s]?(\d{6})/i); if (!mm) continue;
         const code = 'MOBI-' + mm[1], p = waPending.get(code);
+        console.log('WA código', code, p ? 'encontrado' : 'NO encontrado', '· desde …' + tail8(m.from).slice(-4));
         if (!p) { waReply(m.from, 'Ese código venció o no existe. Pedí uno nuevo desde la app de MOBI.'); continue; }
         if (tail8(m.from) !== p.tail) { waReply(m.from, 'Este número no coincide con el que cargaste en MOBI.'); continue; }
         waPending.delete(code); waVerified.set(p.userId, { tail: p.tail, at: Date.now() }); kvSet('wa', p.userId, { tail: p.tail, at: Date.now() });
