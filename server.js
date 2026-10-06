@@ -464,7 +464,30 @@ const waVerified = new Map();   // userId -> { tail, at }
 const tail8 = (v) => String(v || '').replace(/\D/g, '').slice(-8);
 setInterval(() => { const now = Date.now(); for (const [c, v] of waPending) if (now - v.at > 30 * 60_000) waPending.delete(c); }, 5 * 60_000).unref();
 
-app.post('/api/wa/start', (req, res) => {
+/* Número de prueba de Meta (+1 555…): WhatsApp no deja que el usuario escriba primero.
+   En ese caso MOBI le manda antes la plantilla de prueba "hello_world" para abrir el chat. */
+const WA_IS_TEST = WA_NUMBER.startsWith('1555');
+function waE164AR(phone) {
+  let d = String(phone || '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('54')) d = d.slice(2);
+  if (d.startsWith('9')) d = d.slice(1);
+  if (d.startsWith('0')) d = d.slice(1);
+  d = d.replace(/^(\d{2,4})15(\d{6,8})$/, (m, a, n) => (a + n).length === 10 ? a + n : m);   // 011 15 xxxx → sin el 15
+  return d.length === 10 ? '549' + d : null;
+}
+async function waOpenTestChat(phone) {
+  const to = waE164AR(phone);
+  if (!WA_IS_TEST || !WA_TOKEN || !WA_PHONE_ID || !to) return;
+  try {
+    const r = await fetch(`https://graph.facebook.com/v20.0/${encodeURIComponent(WA_PHONE_ID)}/messages`, {
+      method: 'POST', headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'template', template: { name: 'hello_world', language: { code: 'en_US' } } })
+    });
+    if (!r.ok) console.warn('WA hello_world', r.status, (await r.text()).slice(0, 300));
+  } catch (e) { console.warn('WA hello_world', e.message); }
+}
+app.post('/api/wa/start', async (req, res) => {
   const b = req.body || {};
   const userId = String(b.userId || '').slice(0, 60), tail = tail8(b.phone);
   if (!userId || tail.length < 8) return res.status(400).json({ ok: false, error: 'userId y teléfono válidos son obligatorios' });
@@ -472,6 +495,7 @@ app.post('/api/wa/start', (req, res) => {
   let code; do { code = 'MOBI-' + String(crypto.randomInt(0, 1_000_000)).padStart(6, '0'); } while (waPending.has(code));
   waPending.set(code, { userId, tail, at: Date.now() });
   const text = `Hola MOBI, mi código de verificación es ${code}`;
+  await Promise.race([waOpenTestChat(b.phone), new Promise((r) => setTimeout(r, 6000))]);
   res.json({ ok: true, code, configured: Boolean(WA_NUMBER), waNumber: WA_NUMBER || null,
     link: WA_NUMBER ? `https://wa.me/${WA_NUMBER}?text=${encodeURIComponent(text)}` : null });
 });
