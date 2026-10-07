@@ -157,6 +157,32 @@ function pushMessage(room, m) {
   return msg;
 }
 
+/* V362 · una persona puede ser pasajero Y conductor, pero no registrarse dos veces en el mismo rol
+   (mismo celular, o mismo DNI en pasajeros). Los registros rechazados no cuentan. */
+function findDupReg(room, type, d) {
+  if (!d || typeof d !== 'object') return null;
+  const t = tail8(d.phone), dni = String(d.dni || '').replace(/\D/g, '');
+  for (const m of room.sticky.values()) {
+    if (!m || m.type !== type) continue;
+    const o = m.data; if (!o || typeof o !== 'object' || o.id === d.id || o.hiddenAt || o.deletedAt) continue;
+    if (type === 'driver-reg' && !(o.status === 'pendiente' || o.status === 'aprobado')) continue;
+    const same = (t.length >= 8 && tail8(o.phone) === t) || (type === 'pax-reg' && dni.length >= 6 && String(o.dni || '').replace(/\D/g, '') === dni);
+    if (same) return o;
+  }
+  return null;
+}
+function regBlocked(room, m) {
+  if (!m || !m.data) return false;
+  if (m.type === 'driver-reg' && m.data.status === 'pendiente') return !!findDupReg(room, 'driver-reg', m.data);
+  if (m.type === 'pax-reg' && !room.sticky.has('pax-reg|' + (m.key || ''))) return !!findDupReg(room, 'pax-reg', m.data);
+  return false;
+}
+app.post('/api/reg/check', (req, res) => {
+  const b = req.body || {}, role = b.role === 'drv' ? 'driver-reg' : 'pax-reg';
+  const o = findDupReg(getRoom(b.room), role, { id: String(b.id || ''), phone: b.phone, dni: b.dni });
+  res.json({ ok: true, dup: !!o, status: o ? String(o.status || 'aprobado') : '' });
+});
+
 app.post('/api/bus/batch', (req, res) => {
   const { room, messages } = req.body || {};
   if (!Array.isArray(messages)) return res.status(400).json({ ok: false, error: 'messages must be an array' });
@@ -164,6 +190,7 @@ app.post('/api/bus/batch', (req, res) => {
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
     if (m && m.type === 'acct-susp') continue;   // solo el administrador (endpoint propio)
+    if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
       const a = m.data.active, k = a.tripKey, claim = k ? r.claims.get(k) : null;
@@ -179,6 +206,7 @@ app.post('/api/bus/batch', (req, res) => {
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
   if (m && (m.type === 'acct-susp' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
   res.json({ ok: true, id: saved.id });
