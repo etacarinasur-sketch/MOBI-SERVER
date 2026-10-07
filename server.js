@@ -30,7 +30,7 @@ const WA_NUMBER = String(process.env.WA_NUMBER || '').replace(/\D/g, '');       
 const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || '';                        // el que cargás en Meta al configurar el webhook
 const WA_APP_SECRET = process.env.WA_APP_SECRET || '';                            // (opcional) valida que el mensaje venga de Meta
 const WA_TOKEN = process.env.WA_TOKEN || '';                                      // (opcional) para responder "verificado"
-const WA_PHONE_ID = process.env.WA_PHONE_ID || '';
+let WA_PHONE_ID = process.env.WA_PHONE_ID || '';                                  // si falta, se busca solo con WA_WABA_ID
 
 app.disable('x-powered-by');
 app.use(cors({
@@ -274,6 +274,34 @@ async function mpCall(method, url, body, idem) {
   return { ok: r.ok, status: r.status, data };
 }
 
+/* V358 · motivo del rechazo en palabras simples (y queda en el registro de Render) */
+const MP_REASONS = {
+  cc_rejected_high_risk: 'Mercado Pago lo frenó por seguridad (riesgo alto). Suele pasar con cuentas nuevas o si quien paga es la misma cuenta que cobra.',
+  cc_rejected_other_reason: 'El banco rechazó la tarjeta sin dar el motivo.',
+  cc_rejected_insufficient_amount: 'La tarjeta no tiene saldo o límite suficiente.',
+  cc_rejected_bad_filled_security_code: 'El código de seguridad es incorrecto.',
+  cc_rejected_bad_filled_date: 'La fecha de vencimiento es incorrecta.',
+  cc_rejected_bad_filled_other: 'Algún dato de la tarjeta está mal cargado.',
+  cc_rejected_bad_filled_card_number: 'El número de tarjeta es incorrecto.',
+  cc_rejected_call_for_authorize: 'El banco pide autorizar el pago: llamá al banco o usá otra tarjeta.',
+  cc_rejected_card_disabled: 'La tarjeta no está habilitada para compras online. Activala desde el banco.',
+  cc_rejected_blacklist: 'La tarjeta no puede usarse en Mercado Pago.',
+  cc_rejected_duplicated_payment: 'Ya hiciste un pago igual hace un momento.',
+  cc_rejected_max_attempts: 'Llegaste al máximo de intentos. Probá más tarde u otra tarjeta.',
+  cc_rejected_card_type_not_allowed: 'Este tipo de tarjeta no se acepta.',
+  insufficient_amount: 'La tarjeta no tiene saldo o límite suficiente.',
+  high_risk: 'Mercado Pago lo frenó por seguridad (riesgo alto).'
+};
+function mpReason(data) {
+  const txt = JSON.stringify(data || {});
+  const m = txt.match(/cc_rejected_[a-z_]+|insufficient_amount|high_risk/);
+  let r = m ? (MP_REASONS[m[0]] || m[0]) : '';
+  if (!r && /payer.*collector|collector.*payer|same user|mismo usuario/i.test(txt)) r = 'Quien paga no puede ser la misma cuenta de Mercado Pago que cobra.';
+  if (!r && /invalid.*token|card_token/i.test(txt)) r = 'Los datos de la tarjeta vencieron: volvé a cargarla.';
+  if (/^TEST-/.test(MP_ACCESS_TOKEN || '')) r = (r ? r + ' ' : '') + '(El servidor usa credenciales DE PRUEBA: solo funcionan las tarjetas de prueba de Mercado Pago.)';
+  return r || 'Mercado Pago rechazó el cobro.';
+}
+
 app.post('/api/mercadopago/pay', async (req, res) => {
   if (needMp(res)) return;
   const b = req.body || {};
@@ -299,12 +327,13 @@ app.post('/api/mercadopago/pay', async (req, res) => {
   };
   try {
     const r = await mpCall('POST', '/v1/orders', payload, `pay_${reference}`);
-    if (!r.ok) return res.status(r.status).json({ ok: false, error: 'Mercado Pago rechazó el cobro', details: r.data });
+    if (!r.ok) { console.log('MP pago RECHAZADO', r.status, JSON.stringify(r.data).slice(0, 800)); return res.status(r.status).json({ ok: false, error: 'Mercado Pago rechazó el cobro', reason: mpReason(r.data), details: r.data }); }
     const pay = (r.data.transactions && r.data.transactions.payments && r.data.transactions.payments[0]) || {};
     const bad = ['failed', 'rejected', 'canceled', 'cancelled', 'expired'];
     const authorized = !bad.includes(String(r.data.status)) && !bad.includes(String(pay.status));
+    if (!authorized) console.log('MP pago no autorizado', r.data.status, r.data.status_detail || pay.status_detail, JSON.stringify(pay).slice(0, 500));
     res.status(201).json({
-      ok: true, authorized, captureMode, orderId: r.data.id, paymentId: pay.id || null,
+      ok: true, authorized, captureMode, reason: authorized ? undefined : mpReason({ a: r.data.status_detail, b: pay.status_detail, c: pay }), orderId: r.data.id, paymentId: pay.id || null,
       status: r.data.status, statusDetail: r.data.status_detail || pay.status_detail || null,
       paymentStatus: pay.status || null, totalAmount: r.data.total_amount
     });
@@ -503,7 +532,31 @@ async function waSubscribe() {                                  // conecta la cu
     console.log('WA subscribe', r.status, (await r.text()).slice(0, 200));
   } catch (e) { console.warn('WA subscribe', e.message); }
 }
-setTimeout(waSubscribe, 5000);
+/* V361 · número REAL de MOBI: al arrancar se busca su ID (si no está cargado), se registra en la nube (una sola vez) y se conecta a la app */
+async function waGraph(path, opts) {
+  const r = await fetch(`https://graph.facebook.com/v20.0/${path}`, Object.assign({ headers: { Authorization: `Bearer ${WA_TOKEN}` } }, opts || {}));
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  return { ok: r.ok, status: r.status, j };
+}
+async function waAutoSetup() {
+  if (!WA_TOKEN) return;
+  try {
+    if (!WA_PHONE_ID && WA_WABA_ID) {
+      const r = await waGraph(`${WA_WABA_ID}/phone_numbers?fields=id,display_phone_number,verified_name,status,platform_type`);
+      const list = (r.j && r.j.data) || [];
+      const mine = list.find(x => tail8(x.display_phone_number) === tail8(WA_NUMBER)) || list[0];
+      if (mine) { WA_PHONE_ID = String(mine.id); console.log('WA número encontrado:', mine.display_phone_number, mine.verified_name, 'ID', WA_PHONE_ID); }
+      else console.log('WA: no encontré números en la cuenta', WA_WABA_ID, r.status, JSON.stringify(r.j).slice(0, 200));
+    }
+    if (WA_PHONE_ID && !WA_IS_TEST) {
+      const st = await waGraph(`${WA_PHONE_ID}?fields=display_phone_number,verified_name,name_status,status,platform_type`);
+      console.log('WA estado del número', st.status, JSON.stringify(st.j).slice(0, 300));
+      if (st.ok && String(st.j.platform_type || '').toUpperCase() !== 'CLOUD_API') await waRegister();
+    }
+  } catch (e) { console.warn('WA autosetup', e.message); }
+  await waSubscribe();
+}
+setTimeout(waAutoSetup, 5000);
 async function waOpenTestChat(phone, again) {
   const e = waE164AR(phone);
   if (!WA_IS_TEST || !WA_TOKEN || !WA_PHONE_ID || !e) return;
@@ -557,6 +610,7 @@ async function waReply(to, body) {
       });
       const x = (await r.text()).slice(0, 200);
       console.log('WA reply', t, r.status, r.ok ? '' : x);
+      if (/133010/.test(x) && !waReply.__reg) { waReply.__reg = 1; if (await waRegister()) return waReply(to, body); }
       if (r.ok || !/131030|recipient/i.test(x)) return;      // solo se reintenta si el problema es el formato del número
     } catch (e) { console.warn('WA reply', e.message); return; }
   }
