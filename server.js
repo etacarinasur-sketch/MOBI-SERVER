@@ -86,7 +86,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -189,7 +189,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
-    if (m && m.type === 'acct-susp') continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -205,7 +205,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && (m.type === 'acct-susp' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -704,6 +704,23 @@ app.post('/api/admin/paxchg', (req, res) => {
   if (!/^pax_[a-z0-9]{3,20}$/.test(id) || !status) return res.status(400).json({ ok: false, error: 'datos' });
   const data = { id, rid: String(b.rid || '').slice(0, 40), status, reason: String(b.reason || '').slice(0, 200), at: Date.now() };
   const saved = pushMessage(getRoom(b.room), { type: 'pax-chg', key: 'pc:' + id, src: 'admin', data });
+  res.json({ ok: true, data, id: saved && saved.id });
+});
+
+/* V398 · tarifas, comisión y plus por retiro lejano · solo administrador (se reparte a todos por el bus) */
+app.post('/api/admin/pricing', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  const c = b.cfg || {};
+  const num = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+  const data = {
+    base: num(c.base, 0, 50000, 2000), kmRate: num(c.kmRate, 0, 5000, 480), minRate: num(c.minRate, 0, 500, 20),
+    commissionPct: num(c.commissionPct, 0, 30, 3), promoPct: num(c.promoPct, 0, 30, 0), promoUntil: num(c.promoUntil, 0, 4102444800000, 0),
+    farOn: c.farOn ? 1 : 0, farFrom: num(c.farFrom, 0, 20, 2), farRate: num(c.farRate, 0, 3000, 300), farCap: num(c.farCap, 0, 20000, 2000),
+    demandOn: c.demandOn === 0 || c.demandOn === false ? 0 : 1, at: Date.now()
+  };
+  const saved = pushMessage(getRoom(b.room), { type: 'cfg-price', key: 'cfg:price', src: 'admin', data });
+  console.log('Tarifas actualizadas', JSON.stringify(data));
   res.json({ ok: true, data, id: saved && saved.id });
 });
 
