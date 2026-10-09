@@ -673,9 +673,9 @@ app.post('/api/wa/webhook', (req, res) => {
 /* ---------------- fotos de documentos (conductores y vehículos) ----------------
    El conductor sube cada foto una vez al enviar a evaluación. Solo el administrador (con su token) puede verlas,
    y el propio dueño cuando recupera su cuenta con WhatsApp. */
-const DOC_KINDS = new Set(['cedula', 'license', 'dniF', 'dniB', 'profile']);
+const DOC_KINDS = new Set(['cedula', 'license', 'dniF', 'dniB', 'profile', 'proof']);
 const docMem = new Map();                                        // owner|kind -> { img, at }  (respaldo si no hay base)
-const okOwner = (o) => /^(drv_[a-z0-9]{3,20}|car:drv_[a-z0-9]{3,20}:[A-Z0-9]{5,8})$/.test(String(o || ''));
+const okOwner = (o) => /^(drv_[a-z0-9]{3,20}|car:drv_[a-z0-9]{3,20}:[A-Z0-9]{5,8}|trip_[A-Za-z0-9]{6,30})$/.test(String(o || ''));
 app.post('/api/docs/put', async (req, res) => {
   const b = req.body || {}, owner = String(b.owner || ''), kind = String(b.kind || ''), img = String(b.img || '');
   if (!okOwner(owner) || !DOC_KINDS.has(kind)) return res.status(400).json({ ok: false, error: 'bad_owner_or_kind' });
