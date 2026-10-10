@@ -717,7 +717,10 @@ app.post('/api/admin/pricing', (req, res) => {
     base: num(c.base, 0, 50000, 2000), kmRate: num(c.kmRate, 0, 5000, 480), minRate: num(c.minRate, 0, 500, 20),
     commissionPct: num(c.commissionPct, 0, 30, 3), promoPct: num(c.promoPct, 0, 30, 0), promoUntil: num(c.promoUntil, 0, 4102444800000, 0),
     farOn: c.farOn ? 1 : 0, farFrom: num(c.farFrom, 0, 20, 2), farRate: num(c.farRate, 0, 3000, 300), farCap: num(c.farCap, 0, 20000, 2000),
-    demandOn: c.demandOn === 0 || c.demandOn === false ? 0 : 1, at: Date.now()
+    demandOn: c.demandOn === 0 || c.demandOn === false ? 0 : 1,
+    adjPct: num(c.adjPct, 0, 100, 0), adjUntil: num(c.adjUntil, 0, 4102444800000, 0),
+    ruleOn: c.ruleOn ? 1 : 0, ruleDays: num(c.ruleDays, 0, 127, 96), ruleFrom: num(c.ruleFrom, 0, 23, 21), ruleTo: num(c.ruleTo, 0, 23, 3), rulePct: num(c.rulePct, 0, 100, 15),
+    rainOn: c.rainOn ? 1 : 0, rainPct: num(c.rainPct, 0, 100, 10), capPct: num(c.capPct, 0, 100, 60), at: Date.now()
   };
   const saved = pushMessage(getRoom(b.room), { type: 'cfg-price', key: 'cfg:price', src: 'admin', data });
   console.log('Tarifas actualizadas', JSON.stringify(data));
