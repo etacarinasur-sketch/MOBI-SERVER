@@ -135,7 +135,8 @@ const ROOM_TTL = 24 * 3600_000;
 function getRoom(name) {
   const key = String(name || 'pilot').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || 'pilot';
   let r = rooms.get(key);
-  if (!r) { r = { name: key, seq: 0, ring: [], sticky: new Map(), claims: new Map(), touched: Date.now() }; rooms.set(key, r); }
+  if (!r) { r = { name: key, seq: 0, ring: [], sticky: new Map(), claims: new Map(), parts: new Map(), touched: Date.now() }; rooms.set(key, r); }
+  if (!r.parts) r.parts = new Map();
   r.touched = Date.now();
   return r;
 }
@@ -151,6 +152,13 @@ function pushMessage(room, m) {
     at: Date.now(),
     data: m.data === undefined ? null : m.data
   };
+  /* V448 · quién participa de cada viaje: la ubicación y los avances de un viaje ya tomado van solo a ellos (y al administrador) */
+  if (msg.type === 'trip' && msg.data && msg.data.active && msg.data.active.tripKey) {
+    const a = msg.data.active, k = String(a.tripKey);
+    const set = room.parts.get(k) || new Set(); [a.__paxSrc, a.__drvSrc, msg.data.by, msg.src].forEach(x => { if (x) set.add(String(x)); }); room.parts.set(k, set);
+    if (room.parts.size > 5000) room.parts.delete(room.parts.keys().next().value);
+    if (!/Esperando|Buscando|Solicitud/i.test(String(a.status || ''))) { msg.tk = k; msg.priv = 'trip'; }
+  } else if ((msg.type === 'driver-pos' || msg.type === 'pax-pos') && msg.data && msg.data.tripKey) { msg.tk = String(msg.data.tripKey); msg.priv = 'pos'; }
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
@@ -225,8 +233,32 @@ app.get('/api/bus', (req, res) => {
   } else {
     messages = r.ring.filter(x => x.id > after);
   }
-  messages = messages.filter(x => !me || x.src !== me).slice(-400);
-  res.json({ ok: true, messages, last: r.seq });
+  /* V448 · cada celular recibe lo suyo: los demás conductores solo se enteran de que el viaje ya fue tomado (aviso corto) */
+  const all = String(req.query.all || '') === '1';
+  /* V450 · zona: si el celular dice dónde está, solo recibe pedidos y conductores a menos de GEO_KM (el retiro máximo es 4 km; el resto es margen) */
+  const GEO_KM = 6.5;
+  const geo = all ? [] : String(req.query.geo || '').split(';').slice(0, 3).map(t => t.split(',').map(Number)).filter(v => v.length === 2 && v.every(Number.isFinite));
+  const near = pt => { if (!geo.length || !pt || !Number.isFinite(Number(pt.lat)) || !Number.isFinite(Number(pt.lng))) return true;
+    for (const g of geo) { const dl = (Number(pt.lat) - g[0]) * 111.32, dg = (Number(pt.lng) - g[1]) * 111.32 * Math.cos(g[0] * Math.PI / 180); if (dl * dl + dg * dg <= GEO_KM * GEO_KM) return true; } return false; };
+  const inZone = x => {
+    if (!geo.length) return true;
+    if (x.type === 'trip' && x.data && x.data.active && x.data.active.originPlace) { const set = r.parts.get(x.tk || String(x.data.active.tripKey || '')); if (set && set.has(me)) return true; return near(x.data.active.originPlace); }
+    if (x.type === 'drv-pres' && x.data) return near(x.data.pos) || (x.data.dest && near(x.data.dest));
+    return true;
+  };
+  const out = [];
+  for (const x of messages) {
+    if (me && x.src === me) continue;
+    if (!inZone(x)) continue;
+    if (!x.priv || all) { out.push(x); continue; }
+    const set = r.parts.get(x.tk);
+    if (!set || set.has(me)) { out.push(x); continue; }            // sin datos del viaje (p. ej. tras reinicio): se entrega como antes
+    if (x.priv === 'trip') { const a = x.data.active; out.push({ id: x.id, type: x.type, src: x.src, key: x.key, ts: x.ts, at: x.at, data: { active: { tripKey: a.tripKey, status: a.status }, from: x.data.from, rev: x.data.rev, by: x.data.by } }); }
+  }
+  /* V448 · sin pérdidas: si hay más de 400, se entregan los primeros y el resto en el próximo sondeo */
+  let last = r.seq, list = out;
+  if (list.length > 400) { list = list.slice(0, 400); last = list[list.length - 1].id; }
+  res.json({ ok: true, messages: list.map(({ priv, tk, ...m }) => m), last });
 });
 
 /* ------------- adjudicación atómica de viajes ------------- */
