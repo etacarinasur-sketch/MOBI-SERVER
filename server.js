@@ -56,6 +56,7 @@ const rooms = new Map();
    y las verificaciones de WhatsApp. Si no hay base, el servidor sigue funcionando en memoria. */
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim()
   .replace(/([?&])channel_binding=[^&]*&?/, '$1').replace(/[?&]$/, '');   // Neon agrega channel_binding: node-postgres no lo necesita
+let waRegBlockUntil = 0;
 let db = null, dbState = DATABASE_URL ? 'starting' : 'off', dbError = '';
 const dirty = new Map();
 let flushing = false;
@@ -77,6 +78,7 @@ async function dbInit() {
     }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) waVerified.set(row.id, row.data);
+    try { const g = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'wacfg' AND id = 'regblock'`); if (g.rows[0]) waRegBlockUntil = Number(g.rows[0].data.until) || 0; } catch (e) {}
     dbState = 'on';
     console.log(`Base de datos conectada: ${r.rows.length} registros, ${w.rows.length} verificaciones`);
   } catch (e) {
@@ -570,8 +572,12 @@ function waE164AR(phone) {
 }
 const WA_PIN = String(process.env.WA_PIN || '246810').replace(/\D/g, '').slice(0, 6).padEnd(6, '0');
 let waRegisterTried = 0;
+/* V459: si Meta responde 133016 (demasiados intentos de registro) no se vuelve a intentar por 24 h, aunque el servidor se reinicie
+   (el momento se guarda en la base). Cualquier otro fallo espera 30 min. Así los reinicios no queman el límite de Meta. */
+function waBlockRegister(ms) { waRegBlockUntil = Date.now() + ms; kvSet('wacfg', 'regblock', { until: waRegBlockUntil }); }
 async function waRegister() {                                   // error 133010: el número de MOBI no está registrado → registrarlo
   if (!WA_TOKEN || !WA_PHONE_ID || Date.now() - waRegisterTried < 60_000) return false;
+  if (Date.now() < waRegBlockUntil) { console.log('WA register: en pausa hasta', new Date(waRegBlockUntil).toISOString()); return false; }
   waRegisterTried = Date.now();
   try {
     const r = await fetch(`https://graph.facebook.com/v20.0/${encodeURIComponent(WA_PHONE_ID)}/register`, {
@@ -581,6 +587,7 @@ async function waRegister() {                                   // error 133010:
     const t = (await r.text()).slice(0, 300);
     console.log('WA register', r.status, t);
     if (r.ok) await waSubscribe();
+    else waBlockRegister(/133016/.test(t) ? 24 * 3600_000 : 30 * 60_000);
     return r.ok;
   } catch (e) { console.warn('WA register', e.message); return false; }
 }
