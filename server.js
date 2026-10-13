@@ -712,7 +712,7 @@ app.post('/api/wa/webhook', (req, res) => {
 /* ---------------- fotos de documentos (conductores y vehículos) ----------------
    El conductor sube cada foto una vez al enviar a evaluación. Solo el administrador (con su token) puede verlas,
    y el propio dueño cuando recupera su cuenta con WhatsApp. */
-const DOC_KINDS = new Set(['cedula', 'license', 'dniF', 'dniB', 'profile', 'proof']);
+const DOC_KINDS = new Set(['cedula', 'license', 'dniF', 'dniB', 'profile', 'proof', 'delivery']);
 const docMem = new Map();                                        // owner|kind -> { img, at }  (respaldo si no hay base)
 const okOwner = (o) => /^(drv_[a-z0-9]{3,20}|car:drv_[a-z0-9]{3,20}:[A-Z0-9]{5,8}|trip_[A-Za-z0-9]{6,30})$/.test(String(o || ''));
 app.post('/api/docs/put', async (req, res) => {
@@ -760,6 +760,7 @@ app.post('/api/admin/pricing', (req, res) => {
     adjPct: num(c.adjPct, 0, 100, 0), adjUntil: num(c.adjUntil, 0, 4102444800000, 0),
     ruleOn: c.ruleOn ? 1 : 0, ruleDays: num(c.ruleDays, 0, 127, 96), ruleFrom: num(c.ruleFrom, 0, 23, 21), ruleTo: num(c.ruleTo, 0, 23, 3), rulePct: num(c.rulePct, 0, 100, 15),
     rainOn: c.rainOn ? 1 : 0, rainPct: num(c.rainPct, 0, 100, 10), capPct: num(c.capPct, 0, 100, 60),
+    envioOn: c.envioOn === 0 || c.envioOn === false ? 0 : 1, envioPct: num(c.envioPct, 0, 100, 15),
     tgtOn: c.tgtOn === 0 || c.tgtOn === false ? 0 : 1, tgtDisc: num(c.tgtDisc, 0, 40, 15), didiBase: num(c.didiBase, 0, 50000, 3000), didiMin: num(c.didiMin, 0, 100000, 3700), didiKm: num(c.didiKm, 0, 5000, 580), didiTierKm: num(c.didiTierKm, 0, 100, 6), didiKm2: num(c.didiKm2, 0, 5000, 170), didiTier2Km: num(c.didiTier2Km, 0, 200, 12), b1On: c.b1On ? 1 : 0, b1Days: num(c.b1Days, 0, 127, 62), b1From: num(c.b1From, 0, 23, 6), b1To: num(c.b1To, 0, 24, 8), b1Pct: num(c.b1Pct, 0, 150, 20), b2On: c.b2On ? 1 : 0, b2Days: num(c.b2Days, 0, 127, 62), b2From: num(c.b2From, 0, 23, 12), b2To: num(c.b2To, 0, 24, 13), b2Pct: num(c.b2Pct, 0, 150, 20), b3On: c.b3On ? 1 : 0, b3Days: num(c.b3Days, 0, 127, 62), b3From: num(c.b3From, 0, 23, 17), b3To: num(c.b3To, 0, 24, 19), b3Pct: num(c.b3Pct, 0, 150, 15), b4On: c.b4On ? 1 : 0, b4Days: num(c.b4Days, 0, 127, 31), b4From: num(c.b4From, 0, 23, 22), b4To: num(c.b4To, 0, 24, 6), b4Pct: num(c.b4Pct, 0, 150, 25), b5On: c.b5On ? 1 : 0, b5Days: num(c.b5Days, 0, 127, 96), b5From: num(c.b5From, 0, 23, 21), b5To: num(c.b5To, 0, 24, 4), b5Pct: num(c.b5Pct, 0, 150, 40), didiKm3: num(c.didiKm3, 0, 10000, 1500), floorPct: num(c.floorPct, 30, 100, 70), at: Date.now()
   };
   const saved = pushMessage(getRoom(b.room), { type: 'cfg-price', key: 'cfg:price', src: 'admin', data });
@@ -793,6 +794,14 @@ app.post('/api/admin/suspend', (req, res) => {
   const saved = pushMessage(getRoom(b.room), { type: 'acct-susp', key: 'su:' + tail, src: 'admin', data });
   console.log('Cuenta ' + (data.susp ? 'SUSPENDIDA' : 'reactivada') + ' · …' + tail.slice(-4));
   res.json({ ok: true, data, id: saved && saved.id });
+});
+/* V466 · comprobante de pago y foto de entrega de UN viaje: los ve quien tiene el código del viaje (pasajero y conductor, en su historial).
+   Solo devuelve esas dos imágenes del viaje; los documentos personales siguen siendo solo para el administrador. */
+app.post('/api/proof/get', async (req, res) => {
+  const b = req.body || {}, key = String(b.tripKey || ''), kind = String(b.kind || '');
+  if (!/^[A-Za-z0-9]{6,30}$/.test(key) || (kind !== 'proof' && kind !== 'delivery')) return res.status(400).json({ ok: false, error: 'bad_request' });
+  const d = await docsOf('trip_' + key);
+  res.json({ ok: true, img: d[kind] || null });
 });
 app.post('/api/docs/get', async (req, res) => {
   const b = req.body || {}, owner = String(b.owner || '');
