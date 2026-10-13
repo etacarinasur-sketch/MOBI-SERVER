@@ -76,6 +76,25 @@ async function dbInit() {
       room.sticky.set(row.k, msg);
       if (Number(msg.id) > room.seq) room.seq = Number(msg.id);
     }
+    /* V470 · después de un reinicio (deploy o caída): se reconstruye quién participa de cada viaje y qué conductor lo tomó,
+       y la numeración salta hacia adelante para que ningún celular saltee mensajes nuevos creyendo que ya los tenía */
+    try {
+      const cl = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'claim' AND at > now() - interval '6 hours'`);
+      for (const row of cl.rows) { const i = row.id.indexOf('|'); if (i < 0 || !row.data || !row.data.driverId) continue; getRoom(row.id.slice(0, i)).claims.set(row.id.slice(i + 1), { driverId: String(row.data.driverId), at: Number(row.data.at) || Date.now() }); }
+    } catch (e) { console.warn('claims', e.message); }
+    for (const room of rooms.values()) {
+      const list = [...room.sticky.values()].filter((m) => m && m.type === 'trip' && m.data && m.data.active && m.data.active.tripKey).sort((x, y) => x.id - y.id);
+      for (const m of list) {
+        const a = m.data.active, k = String(a.tripKey), set = room.parts.get(k) || new Set();
+        [a.__paxSrc, a.__drvSrc, m.data.by, m.src].forEach((x) => { if (x) set.add(String(x)); }); room.parts.set(k, set);
+        if (m.data.from === 'drv') {
+          const c0 = room.claims.get(k);
+          if (a.driver && a.driver.id && !/Esperando|Buscando|Solicitud/i.test(String(a.status || ''))) { if (!c0 || c0.at < Number(m.at || 0)) room.claims.set(k, { driverId: String(a.driver.id), at: Number(m.at) || Date.now() }); }
+          else if (/Esperando|Buscando/i.test(String(a.status || '')) && c0 && c0.at < Number(m.at || 0)) room.claims.delete(k);
+        }
+      }
+      room.seq += 1_000_000;
+    }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) waVerified.set(row.id, row.data);
     try { const g = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'wacfg' AND id = 'regblock'`); if (g.rows[0]) waRegBlockUntil = Number(g.rows[0].data.until) || 0; } catch (e) {}
@@ -160,7 +179,8 @@ function pushMessage(room, m) {
     const set = room.parts.get(k) || new Set(); [a.__paxSrc, a.__drvSrc, msg.data.by, msg.src].forEach(x => { if (x) set.add(String(x)); }); room.parts.set(k, set);
     if (room.parts.size > 5000) room.parts.delete(room.parts.keys().next().value);
     if (!/Esperando|Buscando|Solicitud/i.test(String(a.status || ''))) { msg.tk = k; msg.priv = 'trip'; }
-  } else if ((msg.type === 'driver-pos' || msg.type === 'pax-pos') && msg.data && msg.data.tripKey) { msg.tk = String(msg.data.tripKey); msg.priv = 'pos'; }
+  } else if ((msg.type === 'driver-pos' || msg.type === 'pax-pos' || msg.type === 'pay-proof' || msg.type === 'pay-proof-meta') && msg.data && msg.data.tripKey) { msg.tk = String(msg.data.tripKey); msg.priv = 'pos'; }
+  else if (msg.type === 'chat' && msg.data && msg.data.tk) { msg.tk = String(msg.data.tk); msg.priv = 'pos'; if (!msg.key && msg.data.m && msg.data.m.id) msg.key = 'ch:' + String(msg.data.m.id).slice(0, 60); }   /* V469 · comprobantes y chat: solo a los dos del viaje (y al administrador) */
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
@@ -206,6 +226,7 @@ app.post('/api/bus/batch', (req, res) => {
       const a = m.data.active, k = a.tripKey, claim = k ? r.claims.get(k) : null;
       const drvId = a.driver && a.driver.id;
       if (claim && drvId && drvId !== claim.driverId && !/Esperando|Buscando/i.test(String(a.status || ''))) continue;
+      if (!claim && drvId && k && m.data.from === 'drv' && !/Esperando|Buscando|Solicitud|Cancel|Finaliz/i.test(String(a.status || ''))) r.claims.set(String(k), { driverId: String(drvId), at: Date.now() });   /* V470 */
     }
     const saved = pushMessage(r, m);
     if (saved) last = saved.id;
@@ -233,7 +254,16 @@ app.get('/api/bus', (req, res) => {
     const recent = r.ring.filter(x => !stickyIds.has(x.id) && Date.now() - x.at < FRESH_MS);
     messages = [...stickyList, ...recent].sort((a, b) => a.id - b.id);
   } else {
-    messages = r.ring.filter(x => x.id > after);
+    const r0 = r.ring.length ? r.ring[0].id : r.seq + 1;
+    if (after < r0 - 1) {
+      /* V469 · el celular se atrasó (sin señal, en segundo plano) más de lo que guarda la memoria corta:
+         se le manda el ÚLTIMO estado de cada cosa que se perdió (viaje, fin, cancelación, chat) y después lo nuevo */
+      const lost = [];
+      for (const x of r.sticky.values()) if (x.id > after && x.id < r0) lost.push(x);
+      lost.sort((a, b) => a.id - b.id);
+      messages = lost.concat(r.ring.filter(x => x.id > after));
+      r.catchups = (r.catchups || 0) + 1;
+    } else messages = r.ring.filter(x => x.id > after);
   }
   /* V448 · cada celular recibe lo suyo: los demás conductores solo se enteran de que el viaje ya fue tomado (aviso corto) */
   const all = String(req.query.all || '') === '1';
@@ -248,12 +278,22 @@ app.get('/api/bus', (req, res) => {
     if (x.type === 'drv-pres' && x.data) return near(x.data.pos) || (x.data.dest && near(x.data.dest));
     return true;
   };
+  /* V469 · el pasajero no necesita la ruta de los pedidos ajenos: solo dónde y cuándo (para la demanda) */
+  const lite = String(req.query.lite || '') === '1' && !all;
   const out = [];
   for (const x of messages) {
     if (me && x.src === me) continue;
     if (!inZone(x)) continue;
+    if (lite && x.type === 'trip' && !x.priv && x.data && x.data.active) {
+      const a = x.data.active, set = r.parts.get(String(a.tripKey || ''));
+      if (!(set && set.has(me)) && a.__paxSrc !== me) {
+        out.push({ id: x.id, type: x.type, src: x.src, key: x.key, ts: x.ts, at: x.at, data: { active: { tripKey: a.tripKey, status: a.status, started: a.started, originPlace: a.originPlace && { lat: a.originPlace.lat, lng: a.originPlace.lng } }, from: x.data.from, rev: x.data.rev, by: x.data.by } });
+        continue;
+      }
+    }
     if (!x.priv || all) { out.push(x); continue; }
     const set = r.parts.get(x.tk);
+    if (x.type === 'pay-proof' && !(set && set.has(me))) continue;   /* V470 · el comprobante nunca va a todos (el conductor lo baja de /api/proof/get) */
     if (!set || set.has(me)) { out.push(x); continue; }            // sin datos del viaje (p. ej. tras reinicio): se entrega como antes
     if (x.priv === 'trip') { const a = x.data.active; out.push({ id: x.id, type: x.type, src: x.src, key: x.key, ts: x.ts, at: x.at, data: { active: { tripKey: a.tripKey, status: a.status }, from: x.data.from, rev: x.data.rev, by: x.data.by } }); }
   }
@@ -267,25 +307,46 @@ app.get('/api/bus', (req, res) => {
 app.post('/api/trip/claim', (req, res) => {
   const { room, tripKey, driverId } = req.body || {};
   if (!tripKey || !driverId) return res.status(400).json({ ok: false, error: 'tripKey and driverId are required' });
-  const r = getRoom(room);
-  const cur = r.claims.get(String(tripKey));
-  if (cur && cur.driverId !== String(driverId)) return res.json({ ok: false, winner: cur.driverId });
-  r.claims.set(String(tripKey), { driverId: String(driverId), at: Date.now() });
-  res.json({ ok: true, winner: String(driverId) });
+  const r = getRoom(room), k = String(tripKey), d = String(driverId);
+  /* V470 · un pedido que el pasajero ya canceló no se puede tomar */
+  const te = r.sticky.get('trip-end|te:' + k), tp = r.sticky.get('trip|tr:' + k + ':pax');
+  if (te || (tp && tp.data && tp.data.active && /Cancel/i.test(String(tp.data.active.status || '')))) return res.json({ ok: false, error: 'ended' });
+  const cur = r.claims.get(k);
+  if (cur && cur.driverId !== d) return res.json({ ok: false, winner: cur.driverId });
+  r.claims.set(k, { driverId: d, at: Date.now() });
+  /* V470 · quién tomó cada viaje se guarda en la base EN SEGUNDO PLANO (no frena a nadie) y se recupera si el servidor se reinicia */
+  if (db && !cur) db.query(`INSERT INTO mobi_kv (ns, id, data, at) VALUES ('claim', $1, $2::jsonb, now()) ON CONFLICT (ns, id) DO UPDATE SET data = EXCLUDED.data, at = now()`, [r.name + '|' + k, JSON.stringify({ driverId: d, at: Date.now() })]).catch(() => {});
+  res.json({ ok: true, winner: d });
 });
 app.post('/api/trip/release', (req, res) => {
   const { room, tripKey, driverId } = req.body || {};
-  const r = getRoom(room);
-  const cur = r.claims.get(String(tripKey));
-  if (cur && (!driverId || cur.driverId === String(driverId))) r.claims.delete(String(tripKey));
+  const r = getRoom(room), k = String(tripKey);
+  const cur = r.claims.get(k);
+  if (cur && (!driverId || cur.driverId === String(driverId))) {
+    r.claims.delete(k);
+    if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'claim' AND id = $1`, [r.name + '|' + k]).catch(() => {});
+  }
   res.json({ ok: true });
 });
+
+setInterval(() => { if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'claim' AND at < now() - interval '6 hours'`).catch(() => {}); }, 30 * 60_000).unref();
 
 setInterval(() => {
   const now = Date.now();
   for (const [k, r] of rooms) {
     if (now - r.touched > ROOM_TTL) { rooms.delete(k); continue; }
     for (const [ck, c] of r.claims) if (now - c.at > 6 * 3600_000) r.claims.delete(ck);
+  }
+}, 10 * 60_000).unref();
+
+/* V469 · la memoria de "último estado" no crece sin fin: posiciones viejas, chats y viajes de más de 3 días se sueltan */
+setInterval(() => {
+  const now = Date.now();
+  for (const r of rooms.values()) for (const [k, m] of r.sticky) {
+    if (!m) continue; const age = now - Number(m.at || 0);
+    if ((m.type === 'driver-pos' || m.type === 'pax-pos' || m.type === 'approach-route') && age > 30 * 60_000) r.sticky.delete(k);
+    else if (m.type === 'chat' && age > 6 * 3600_000) r.sticky.delete(k);
+    else if (m.type === 'trip' && age > 3 * 86400_000) r.sticky.delete(k);
   }
 }, 10 * 60_000).unref();
 
@@ -855,4 +916,4 @@ setInterval(purgeUnverified, 6 * 3600_000).unref();
 await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
 /* al apagar, guardar lo pendiente */
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { try { for (const [k, v] of dirtySlow) dirty.set(k, v); await flushSticky(); } catch (e) {} process.exit(0); });
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { try { for (let i = 0; i < 50 && flushing; i++) await new Promise((r) => setTimeout(r, 100)); for (const [k, v] of dirtySlow) dirty.set(k, v); await flushSticky(); } catch (e) {} process.exit(0); });
