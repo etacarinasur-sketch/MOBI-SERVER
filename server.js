@@ -96,6 +96,7 @@ async function dbInit() {
       room.seq += 1_000_000;
     }
     try { const st = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'addrstat' AND id = 'all'`); if (st.rows[0]) Object.assign(addrStat, st.rows[0].data); } catch (e) { console.warn('addrstat', e.message); }
+    try { const pv = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'push'`); for (const row of pv.rows) { if (row.id === 'vapid') pushVapidLoad(row.data); else if (row.id === 'last') { Object.assign(pushLast.periodic, row.data.periodic || {}); Object.assign(pushLast.demand, row.data.demand || {}); } else pushSubs.set(row.id, row.data); } } catch (e) { console.warn('push', e.message); } pushLoaded = true;
     try { const ad = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'addr'`); for (const row of ad.rows) addrMem.set(row.id, row.data); } catch (e) { console.warn('addr', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) waVerified.set(row.id, row.data);
@@ -103,13 +104,13 @@ async function dbInit() {
     dbState = 'on';
     console.log(`Base de datos conectada: ${r.rows.length} registros, ${w.rows.length} verificaciones`);
   } catch (e) {
-    dbState = 'error'; dbError = e.message; db = null;
+    dbState = 'error'; dbError = e.message; db = null; pushLoaded = true;
     console.warn('No se pudo conectar la base de datos (sigo en memoria):', e.message);
   }
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'refund-req']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'refund-req', 'cfg-push']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -222,7 +223,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'drv-slots')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -239,7 +240,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'drv-slots' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -874,6 +875,10 @@ function cupoCompute(r) {
   }
   for (const k of Object.keys(notify)) if (!ids.has(k) || !enabled[k]) delete notify[k];
   const waiting = el.filter((x) => !enabled[x.id]).map((x) => x.id);
+  if (r.sticky.has('drv-slots|slots')) {   /* V478 · avisos push: lugar nuevo / lista de espera (textos editables en Administración) */
+    for (const id of Object.keys(enabled)) if (!st.enabled[id]) pushNotify(id, pushText(r, waited[id] ? 'freed' : 'approved'));
+    for (const id of waiting) if (!st.waited[id]) pushNotify(id, pushText(r, 'waiting'));
+  }
   const sig = JSON.stringify([Object.keys(enabled).sort(), waiting, Object.keys(notify).sort(), cfg.cupo, cfg.days]);
   if (r._cupoSig === sig) return; r._cupoSig = sig;
   pushMessage(r, { type: 'drv-slots', key: 'slots', src: 'server', data: { enabled, waiting, waited, notify, lapsed, known, cupo: cfg.cupo, days: cfg.days, total: el.length, at: now } });
@@ -977,6 +982,175 @@ app.post('/api/admin/addrstats', (req, res) => {
   const b = req.body || {};
   if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   res.json({ ok: true, stats: addrStat });
+});
+
+
+/* ---------------- V478 · avisos push reales (llegan aunque la app esté cerrada) ----------------
+   Sin paquetes extra: el server crea solo su par de claves (VAPID), las guarda en la base y "toca" al celular con un aviso vacío;
+   el celular le pregunta al server qué decía y lo muestra. Solo se le habla a servicios de push conocidos. */
+let pushPriv = null, pushPub = '', pushLoaded = false;
+const pushLast = { periodic: {}, demand: {} };
+let pushLastDirty = false;
+const pushSubs = new Map();         // hash(endpoint) -> { endpoint, uid, at }
+const pushQueue = new Map();        // hash(endpoint) -> [{ title, body, url, at }]
+const pushRate = new Map();
+const pushHost = /(^|\.)(googleapis\.com|push\.services\.mozilla\.com|push\.apple\.com|notify\.windows\.com)$/i;
+const b64u = (b) => Buffer.from(b).toString('base64url');
+const pushHash = (ep) => crypto.createHash('sha256').update(String(ep)).digest('hex').slice(0, 40);
+function pushVapidLoad(d) { try { pushPriv = crypto.createPrivateKey(d.pem); pushPub = String(d.pub); } catch (e) { pushPriv = null; } }
+function pushVapidEnsure() {
+  if (pushPriv || !pushLoaded) return;
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const j = publicKey.export({ format: 'jwk' });
+  const pub = b64u(Buffer.concat([Buffer.from([4]), Buffer.from(j.x, 'base64url'), Buffer.from(j.y, 'base64url')]));
+  const pem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+  pushPriv = privateKey; pushPub = pub; kvSet('push', 'vapid', { pem, pub });
+  console.log('Push: claves nuevas creadas');
+}
+function pushJwt(aud) {
+  const head = b64u(JSON.stringify({ typ: 'JWT', alg: 'ES256' })), body = b64u(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'https://mobi-server.onrender.com' }));
+  const sig = crypto.sign('sha256', Buffer.from(head + '.' + body), { key: pushPriv, dsaEncoding: 'ieee-p1363' });
+  return head + '.' + body + '.' + b64u(sig);
+}
+async function pushTouch(h, sub) {
+  try {
+    const u = new URL(sub.endpoint);
+    const r = await fetch(sub.endpoint, { method: 'POST', headers: { TTL: '86400', Urgency: 'high', 'Content-Length': '0', Authorization: 'vapid t=' + pushJwt(u.origin) + ', k=' + pushPub } });
+    if (r.status === 404 || r.status === 410) { pushSubs.delete(h); pushQueue.delete(h); if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]).catch(() => {}); }
+    else if (!r.ok) console.warn('Push', r.status);
+    return r.ok;
+  } catch (e) { console.warn('Push', e.message); return false; }
+}
+function pushNotify(uid, note) {
+  if (note && note.skip) return 0; pushVapidEnsure(); if (!uid || !pushPriv) return 0; let n = 0;
+  for (const [h, sub] of pushSubs) {
+    if (String(sub.uid) !== String(uid)) continue;
+    const q = pushQueue.get(h) || []; q.push({ title: String(note.title || 'MOBI').slice(0, 80), body: String(note.body || '').slice(0, 200), url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
+    pushTouch(h, sub); n++;
+  }
+  return n;
+}
+app.get('/api/push/key', (req, res) => { pushVapidEnsure(); res.json({ ok: !!pushPub, key: pushPub }); });
+app.post('/api/push/sub', (req, res) => {
+  const b = req.body || {}, ep = String((b.sub && b.sub.endpoint) || ''), uid = String(b.uid || '').slice(0, 60);
+  let host = ''; try { const u = new URL(ep); if (u.protocol === 'https:') host = u.hostname; } catch (e) {}
+  if (!host || ep.length > 700 || !pushHost.test(host) || !/^[A-Za-z0-9_.:-]{3,60}$/.test(uid)) return res.status(400).json({ ok: false });
+  const ip = String(req.ip || ''), now = Date.now(), r = pushRate.get(ip) || { n: 0, t: now };
+  if (now - r.t > 3600_000) { r.n = 0; r.t = now; } if (++r.n > 30) return res.status(429).json({ ok: false }); pushRate.set(ip, r);
+  if (pushRate.size > 5000) pushRate.delete(pushRate.keys().next().value);
+  if (pushSubs.size > 20000) return res.status(503).json({ ok: false });
+  const rm = /^[a-zA-Z0-9_-]{1,40}$/.test(String(b.room || '')) ? String(b.room) : 'pilot', h = pushHash(ep), item = { endpoint: ep, uid, room: rm, at: now };
+  pushSubs.set(h, item); kvSet('push', h, item); res.json({ ok: true });
+});
+app.post('/api/push/pending', (req, res) => {
+  const ep = String((req.body || {}).endpoint || ''); const h = pushHash(ep);
+  const q = (pushQueue.get(h) || []).filter((m) => Date.now() - m.at < 86400_000); pushQueue.delete(h);
+  res.json({ ok: true, msgs: q });
+});
+app.post('/api/admin/push-test', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  res.json({ ok: true, sent: pushNotify(String(b.uid || ''), { title: String(b.title || 'MOBI'), body: String(b.body || 'Prueba de aviso') }) });
+});
+
+
+/* ---------------- V478 · avisos configurables desde Administración ---------------- */
+const PUSH_DEF = {
+  nightFrom: 23, nightTo: 7,
+  approved: { on: 1, title: '¡Tu cuenta fue verificada!', body: 'Ya podés empezar a manejar con MOBI. Abrí la app y conectate.' },
+  waiting: { on: 1, title: 'Tu cuenta fue verificada', body: 'Hoy no hay lugar disponible. Te avisamos apenas se libere uno.' },
+  freed: { on: 1, title: '¡Se liberó un lugar!', body: 'Ya podés conectarte y manejar con MOBI.' },
+  periodic: { on: 0, hours: 8, title: '¿Listo para manejar?', body: 'Conectate en MOBI y recibí viajes cerca tuyo.' },
+  demand: { on: 1, minWait: 2, ratio: 1.5, sustainSec: 120, cooldownMin: 60, activeMin: 60, title: '📈 ¡Alta demanda en MOBI!', body: 'Las tarifas subieron. Conectate ahora y aprovechá la oportunidad.' }
+};
+function pushCfg(r) {
+  const m = r.sticky.get('cfg-push|cfg:push'), d = (m && m.data) || {}, out = JSON.parse(JSON.stringify(PUSH_DEF));
+  const num = (v, lo, hi, def) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def; };
+  const txt = (v, def, n) => { v = String(v == null ? '' : v).trim().slice(0, n); return v || def; };
+  out.nightFrom = num(d.nightFrom, 0, 23, out.nightFrom); out.nightTo = num(d.nightTo, 0, 23, out.nightTo);
+  for (const k of ['approved', 'waiting', 'freed', 'periodic', 'demand']) {
+    const x = d[k] || {};
+    out[k].on = (x.on === 0 || x.on === false) ? 0 : (x.on === undefined ? out[k].on : 1);
+    out[k].title = txt(x.title, out[k].title, 80); out[k].body = txt(x.body, out[k].body, 200);
+  }
+  out.periodic.hours = num((d.periodic || {}).hours, 1, 72, out.periodic.hours);
+  const dm = d.demand || {};
+  out.demand.minWait = num(dm.minWait, 1, 50, out.demand.minWait); out.demand.ratio = num(dm.ratio, 1, 10, out.demand.ratio);
+  out.demand.sustainSec = num(dm.sustainSec, 0, 1800, out.demand.sustainSec); out.demand.cooldownMin = num(dm.cooldownMin, 5, 1440, out.demand.cooldownMin);
+  out.demand.activeMin = num(dm.activeMin, 5, 1440, out.demand.activeMin);
+  return out;
+}
+function pushText(r, k) { const c = pushCfg(r)[k]; return c && c.on ? { title: c.title, body: c.body } : { skip: 1 }; }
+const arHour = () => Number(new Intl.DateTimeFormat('en-GB', { hour: '2-digit', hour12: false, timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date())) % 24;
+function pushNight(c) { const h = arHour(), a = c.nightFrom, b = c.nightTo; return a === b ? false : (a > b ? (h >= a || h < b) : (h >= a && h < b)); }
+function pushDrivers(r) {   // conductores aprobados con lugar: id -> { present, seenAt }
+  const out = new Map(), now = Date.now();
+  for (const m of r.sticky.values()) {
+    if (!m || m.type !== 'driver-reg' || !m.data || !m.data.id) continue;
+    const d = m.data; if (d.status !== 'aprobado' || d.hiddenAt || d.deletedAt) continue;
+    const id = String(d.id); if (cupoWaiting(r, id)) continue;
+    const p = r.sticky.get('drv-pres|dpres:' + id), present = !!(p && p.data && p.data.online !== false && now - p.at < 90000);
+    out.set(id, { present, seenAt: Number(r.seen && r.seen.get(id)) || 0 });
+  }
+  return out;
+}
+const pushSurge = new Map();
+function pushTick() {
+  if (!pushLoaded) return; pushVapidEnsure(); if (!pushPriv) return;
+  const now = Date.now();
+  for (const r of rooms.values()) {
+    const subsHere = [...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name); if (!subsHere.length) continue;
+    const c = pushCfg(r), drv = pushDrivers(r), uids = [...new Set(subsHere.map((x) => String(x.uid)))].filter((id) => drv.has(id));
+    // 1) recordatorio periódico: nunca de noche; el primer ciclo arranca desde que el conductor activó los avisos
+    if (c.periodic.on && !pushNight(c)) for (const id of uids) {
+      const last = pushLast.periodic[id];
+      if (last === undefined) { pushLast.periodic[id] = now; pushLastDirty = true; continue; }
+      if (now - last >= c.periodic.hours * 3600_000 && !drv.get(id).present) { pushNotify(id, c.periodic); pushLast.periodic[id] = now; pushLastDirty = true; }
+    }
+    // 2) alta demanda: también de noche, solo a quienes estuvieron activos en la última hora y hoy no están conectados
+    if (c.demand.on) {
+      let wait = 0, avail = 0;
+      for (const m of r.sticky.values()) {
+        if (m.type === 'trip' && m.data && m.data.active && /Esperando|Buscando/i.test(String(m.data.active.status || '')) && now - m.at < 240000) wait++;
+        else if (m.type === 'drv-pres' && m.data && m.data.online !== false && !m.data.busy && now - m.at < 90000) avail++;
+      }
+      const pm = r.sticky.get('cfg-price|cfg:price'), pd = (pm && pm.data) || {}, manual = Number(pd.adjUntil) > now && Number(pd.adjPct) > 0;
+      const hot = manual || (wait >= c.demand.minWait && avail >= 1 && wait / avail >= c.demand.ratio);
+      if (hot) { if (!pushSurge.has(r.name)) pushSurge.set(r.name, now); } else pushSurge.delete(r.name);
+      if (hot && now - pushSurge.get(r.name) >= c.demand.sustainSec * 1000) for (const id of uids) {
+        const x = drv.get(id), last = pushLast.demand[id] || 0;
+        if (x.present || now - x.seenAt > c.demand.activeMin * 60000 || now - last < c.demand.cooldownMin * 60000) continue;
+        pushNotify(id, c.demand); pushLast.demand[id] = now; pushLastDirty = true;
+      }
+    }
+  }
+  if (pushLastDirty) { pushLastDirty = false; kvSet('push', 'last', pushLast); }
+}
+setInterval(pushTick, 60_000).unref();
+app.post('/api/admin/push-cfg', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), data = Object.assign({}, b.cfg || {}, { at: Date.now() });
+  pushMessage(r, { type: 'cfg-push', key: 'cfg:push', src: 'admin', data });
+  console.log('Avisos actualizados'); res.json({ ok: true, cfg: pushCfg(r) });
+});
+app.post('/api/admin/push-stats', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), drv = pushDrivers(r), subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
+  res.json({ ok: true, drivers: drv.size, subscribed: [...drv.keys()].filter((id) => subs.has(id)).length, cfg: pushCfg(r) });
+});
+app.post('/api/admin/push-send', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const title = String(b.title || '').trim().slice(0, 80), body = String(b.body || '').trim().slice(0, 200), aud = ['all', 'recent', 'offline'].includes(b.audience) ? b.audience : 'all';
+  if (!title || !body) return res.status(400).json({ ok: false, error: 'texto' });
+  if (!pushLoaded) return res.status(503).json({ ok: false });
+  const r = getRoom(b.room), drv = pushDrivers(r), now = Date.now(); let n = 0;
+  const subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
+  for (const [id, x] of drv) {
+    if (!subs.has(id)) continue;
+    if (aud === 'recent' && now - x.seenAt > 24 * 3600_000) continue;
+    if (aud === 'offline' && x.present) continue;
+    if (pushNotify(id, { title, body })) n++;
+  }
+  console.log('Aviso manual enviado a', n, 'conductores'); res.json({ ok: true, sent: n, eligible: drv.size });
 });
 
 app.post('/api/addr/find', (req, res) => {
