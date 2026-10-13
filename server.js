@@ -775,7 +775,7 @@ app.post('/api/admin/debtpolicy', (req, res) => {
   const p = b.policy || {};
   const num = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
   const str = (v, n) => String(v || '').trim().slice(0, n);
-  const data = { limit: num(p.limit, 1000, 10000000, 10000), minPct: num(p.minPct, 1, 100, 60), alias: str(p.alias, 60) || 'mobi.cobros', holder: str(p.holder, 80) || 'MOBI', link: str(p.link, 300), wa: str(p.wa, 20).replace(/\D/g, ''), at: Date.now() };
+  const data = { limit: num(p.limit, 1000, 10000000, 10000), minPct: num(p.minPct, 1, 100, 60), alias: str(p.alias, 60) || 'mobi.cobros', holder: str(p.holder, 80) || 'MOBI', link: str(p.link, 300), wa: str(p.wa, 20).replace(/\D/g, ''), depot: str(p.depot, 160), at: Date.now() };
   const saved = pushMessage(getRoom(b.room), { type: 'cfg-debt', key: 'cfg:debt', src: 'admin', data });
   console.log('Política de deuda actualizada', JSON.stringify(data));
   res.json({ ok: true, data, id: saved && saved.id });
