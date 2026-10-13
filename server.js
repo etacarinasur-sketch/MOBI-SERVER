@@ -95,6 +95,7 @@ async function dbInit() {
       }
       room.seq += 1_000_000;
     }
+    try { const st = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'addrstat' AND id = 'all'`); if (st.rows[0]) Object.assign(addrStat, st.rows[0].data); } catch (e) { console.warn('addrstat', e.message); }
     try { const ad = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'addr'`); for (const row of ad.rows) addrMem.set(row.id, row.data); } catch (e) { console.warn('addr', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) waVerified.set(row.id, row.data);
@@ -797,6 +798,7 @@ async function docsOf(owner) {
   for (const [id, v] of docMem) if (id.startsWith(owner + '|') && !out[id.split('|')[1]]) out[id.split('|')[1]] = v.img;
   return out;
 }
+function sbxOk(b) { return String(b && b.token) === 'sbx' && /^sandbox/.test(String((b && b.room) || '')); }   /* el sandbox no tiene clave real: solo vale para su propia sala de pruebas */
 function adminOk(t) { const exp = adminTokens.get(String(t || '')); return !!(exp && exp > Date.now()); }
 
 /* V352 · aprobar / rechazar cambios de datos de un pasajero · solo administrador */
@@ -879,7 +881,7 @@ function cupoCompute(r) {
 setInterval(() => { for (const r of rooms.values()) { try { cupoCompute(r); } catch (e) { console.warn('cupo', e.message); } } }, 30_000).unref();
 app.post('/api/admin/cupo', (req, res) => {
   const b = req.body || {};
-  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const r = getRoom(b.room), num = (v, lo, hi, d) => { v = Math.floor(Number(v)); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
   const data = { cupo: num(b.cupo, 0, 5000, 0), days: num(b.days, 1, 60, 3), at: Date.now() };
   pushMessage(r, { type: 'cfg-cupo', key: 'cfg:cupo', src: 'admin', data });
@@ -889,7 +891,7 @@ app.post('/api/admin/cupo', (req, res) => {
 });
 app.post('/api/admin/cupo-notified', (req, res) => {
   const b = req.body || {};
-  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const r = getRoom(b.room), m = r.sticky.get('drv-slots|slots'), id = String(b.id || '');
   if (m && m.data && m.data.notify && m.data.notify[id]) { const d = Object.assign({}, m.data, { notify: Object.assign({}, m.data.notify) }); delete d.notify[id]; r._cupoSig = ''; pushMessage(r, { type: 'drv-slots', key: 'slots', src: 'server', data: d }); }
   res.json({ ok: true });
@@ -952,6 +954,31 @@ app.post('/api/addr/verify', (req, res) => {
   kvSet('addr', key, e);
   res.json({ ok: true, verified: !!addrBest(e) });
 });
+
+/* V474 · acierto de cada fuente de direcciones: cuánto se equivocó el punto que mostró la lista frente a lo que confirmó la gente */
+const addrStat = {};      // fuente -> { n, ok, sum, big }
+let addrStatDirty = false;
+const statRate = new Map();
+app.post('/api/addr/stat', (req, res) => {
+  const b = req.body || {};
+  if (/^sandbox/.test(String(b.room || ''))) return res.json({ ok: true });                 // el sandbox no mezcla sus pruebas
+  const src = String(b.src || '').replace(/[^A-Za-z]/g, '').slice(0, 20), err = Number(b.err);
+  if (!src || !Number.isFinite(err) || err < 0) return res.status(400).json({ ok: false });
+  const ip = String(req.ip || ''), now = Date.now(), r = statRate.get(ip) || { n: 0, t: now };
+  if (now - r.t > 3600_000) { r.n = 0; r.t = now; } if (++r.n > 120) return res.status(429).json({ ok: false }); statRate.set(ip, r);
+  if (statRate.size > 5000) statRate.delete(statRate.keys().next().value);
+  if (!addrStat[src] && Object.keys(addrStat).length >= 12) return res.json({ ok: true });
+  const x = addrStat[src] || (addrStat[src] = { n: 0, ok: 0, sum: 0, big: 0 });
+  x.n++; x.sum += Math.min(err, 5000); if (err < 30) x.ok++; if (err > 100) x.big++;
+  addrStatDirty = true; res.json({ ok: true });
+});
+setInterval(() => { if (addrStatDirty) { addrStatDirty = false; kvSet('addrstat', 'all', addrStat); } }, 60_000).unref();
+app.post('/api/admin/addrstats', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  res.json({ ok: true, stats: addrStat });
+});
+
 app.post('/api/addr/find', (req, res) => {
   const q = String((req.body || {}).q || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').slice(0, 60).trim();
   if (q.length < 3) return res.json({ ok: true, items: [] });
