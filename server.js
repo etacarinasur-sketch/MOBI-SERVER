@@ -95,6 +95,7 @@ async function dbInit() {
       }
       room.seq += 1_000_000;
     }
+    try { const ad = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'addr'`); for (const row of ad.rows) addrMem.set(row.id, row.data); } catch (e) { console.warn('addr', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) waVerified.set(row.id, row.data);
     try { const g = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'wacfg' AND id = 'regblock'`); if (g.rows[0]) waRegBlockUntil = Number(g.rows[0].data.until) || 0; } catch (e) {}
@@ -107,7 +108,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'refund-req']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -181,6 +182,7 @@ function pushMessage(room, m) {
     if (!/Esperando|Buscando|Solicitud/i.test(String(a.status || ''))) { msg.tk = k; msg.priv = 'trip'; }
   } else if ((msg.type === 'driver-pos' || msg.type === 'pax-pos' || msg.type === 'pay-proof' || msg.type === 'pay-proof-meta') && msg.data && msg.data.tripKey) { msg.tk = String(msg.data.tripKey); msg.priv = 'pos'; }
   else if (msg.type === 'chat' && msg.data && msg.data.tk) { msg.tk = String(msg.data.tk); msg.priv = 'pos'; if (!msg.key && msg.data.m && msg.data.m.id) msg.key = 'ch:' + String(msg.data.m.id).slice(0, 60); }   /* V469 · comprobantes y chat: solo a los dos del viaje (y al administrador) */
+  if (msg.type === 'drv-pres' && msg.data && msg.data.id && msg.data.online !== false) { if (!room.seen) room.seen = new Map(); room.seen.set(String(msg.data.id), Date.now()); }   /* V473 · última vez conectado (para el cupo) */
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
@@ -219,7 +221,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'drv-slots')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -236,7 +238,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'drv-slots' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -311,6 +313,7 @@ app.post('/api/trip/claim', (req, res) => {
   /* V470 · un pedido que el pasajero ya canceló no se puede tomar */
   const te = r.sticky.get('trip-end|te:' + k), tp = r.sticky.get('trip|tr:' + k + ':pax');
   if (te || (tp && tp.data && tp.data.active && /Cancel/i.test(String(tp.data.active.status || '')))) return res.json({ ok: false, error: 'ended' });
+  if (cupoWaiting(r, d)) return res.json({ ok: false, error: 'cupo' });   /* V473 · en lista de espera */
   const cur = r.claims.get(k);
   if (cur && cur.driverId !== d) return res.json({ ok: false, winner: cur.driverId });
   r.claims.set(k, { driverId: d, at: Date.now() });
@@ -829,6 +832,69 @@ app.post('/api/admin/pricing', (req, res) => {
   res.json({ ok: true, data, id: saved && saved.id });
 });
 
+
+/* ---------------- V473 · CUPO de conductores con lista de espera (todo automático) ----------------
+   El administrador aprueba a todos; el sistema habilita por fecha de registro hasta el cupo (0 = sin límite).
+   Si un habilitado pasa N días sin conectarse, su lugar pasa solo al siguiente de la fila (y él vuelve al final). */
+const CUPO_BOOT = Date.now();
+function cupoCfg(r) { const m = r.sticky.get('cfg-cupo|cfg:cupo'); const d = (m && m.data) || {}; return { cupo: Math.max(0, Math.min(5000, Math.floor(Number(d.cupo)) || 0)), days: Math.max(1, Math.min(60, Math.floor(Number(d.days)) || 3)) }; }
+function cupoState(r) { const m = r.sticky.get('drv-slots|slots'); const d = (m && m.data) || {}; return { enabled: Object.assign({}, d.enabled), waited: Object.assign({}, d.waited), notify: Object.assign({}, d.notify), lapsed: Object.assign({}, d.lapsed) }; }
+function cupoWaiting(r, id) {
+  const m = r.sticky.get('drv-slots|slots'); const d = m && m.data; if (!d || !(d.cupo > 0)) return false;
+  return !(d.enabled && d.enabled[id]) && !!(d.known && d.known[id]);
+}
+function cupoCompute(r) {
+  const cfg = cupoCfg(r), st = cupoState(r), now = Date.now(), dayMs = 86400000;
+  const el = [];
+  for (const m of r.sticky.values()) {
+    if (!m || m.type !== 'driver-reg' || !m.data) continue; const d = m.data;
+    if (d.status !== 'aprobado' || d.hiddenAt || d.deletedAt || !d.id) continue;
+    el.push({ id: String(d.id), t: Number(st.lapsed[d.id]) || Number(d.registeredAt) || Number(d.submittedAt) || Number(d.reviewedAt) || 0 });
+  }
+  el.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+  const ids = new Set(el.map((x) => x.id)), known = {}; el.forEach((x) => { known[x.id] = 1; });
+  const enabled = {}, waited = Object.assign({}, st.waited), notify = Object.assign({}, st.notify), lapsed = Object.assign({}, st.lapsed);
+  if (!(cfg.cupo > 0)) { for (const x of el) { enabled[x.id] = st.enabled[x.id] || now; if (waited[x.id] && !st.enabled[x.id]) notify[x.id] = now; } }
+  else {
+    let n = 0;
+    for (const x of el) {   // los que ya tenían lugar y siguen activos lo conservan
+      const at = st.enabled[x.id]; if (!at) continue;
+      const seen = Math.max(Number(r.seen && r.seen.get(x.id)) || 0, Number(at) || 0, CUPO_BOOT);
+      if (now - seen > cfg.days * dayMs) { lapsed[x.id] = now; delete notify[x.id]; continue; }
+      if (n >= cfg.cupo) continue;   /* se bajó el cupo: quedan los más antiguos */
+      enabled[x.id] = at; n++;
+    }
+    for (const x of el) {   // el resto, por orden de fila
+      if (enabled[x.id]) continue;
+      if (n < cfg.cupo) { enabled[x.id] = now; n++; if (waited[x.id]) notify[x.id] = now; }
+      else waited[x.id] = waited[x.id] || now;
+    }
+  }
+  for (const k of Object.keys(notify)) if (!ids.has(k) || !enabled[k]) delete notify[k];
+  const waiting = el.filter((x) => !enabled[x.id]).map((x) => x.id);
+  const sig = JSON.stringify([Object.keys(enabled).sort(), waiting, Object.keys(notify).sort(), cfg.cupo, cfg.days]);
+  if (r._cupoSig === sig) return; r._cupoSig = sig;
+  pushMessage(r, { type: 'drv-slots', key: 'slots', src: 'server', data: { enabled, waiting, waited, notify, lapsed, known, cupo: cfg.cupo, days: cfg.days, total: el.length, at: now } });
+}
+setInterval(() => { for (const r of rooms.values()) { try { cupoCompute(r); } catch (e) { console.warn('cupo', e.message); } } }, 30_000).unref();
+app.post('/api/admin/cupo', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), num = (v, lo, hi, d) => { v = Math.floor(Number(v)); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+  const data = { cupo: num(b.cupo, 0, 5000, 0), days: num(b.days, 1, 60, 3), at: Date.now() };
+  pushMessage(r, { type: 'cfg-cupo', key: 'cfg:cupo', src: 'admin', data });
+  cupoCompute(r);
+  console.log('Cupo actualizado', JSON.stringify(data));
+  res.json({ ok: true, data });
+});
+app.post('/api/admin/cupo-notified', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), m = r.sticky.get('drv-slots|slots'), id = String(b.id || '');
+  if (m && m.data && m.data.notify && m.data.notify[id]) { const d = Object.assign({}, m.data, { notify: Object.assign({}, m.data.notify) }); delete d.notify[id]; r._cupoSig = ''; pushMessage(r, { type: 'drv-slots', key: 'slots', src: 'server', data: d }); }
+  res.json({ ok: true });
+});
+
 /* V445 · política de deuda (límite, % mínimo, alias de cobro) · solo administrador (se reparte a todos por el bus) */
 app.post('/api/admin/debtpolicy', (req, res) => {
   const b = req.body || {};
@@ -858,6 +924,42 @@ app.post('/api/admin/suspend', (req, res) => {
 });
 /* V466 · comprobante de pago y foto de entrega de UN viaje: los ve quien tiene el código del viaje (pasajero y conductor, en su historial).
    Solo devuelve esas dos imágenes del viaje; los documentos personales siguen siendo solo para el administrador. */
+/* ---------------- V471 · libreta de direcciones VERIFICADAS ----------------
+   Cada vez que un pasajero corrige el pin ("Ajustar") o un conductor llega de verdad a una dirección, queda el lugar real.
+   La próxima persona que escriba esa misma calle y número la ve primero y con el punto correcto. */
+const addrMem = new Map();                                     // "calle numero|localidad" -> { label, pts:[{lat,lng,w,at}], at }
+const ADDR_KEY = /^[a-z0-9 ]{3,60}\|[a-z0-9 ]{2,40}$/;
+const addrRate = new Map();
+const addrDist = (a, b) => { const k = Math.cos(a.lat * Math.PI / 180) * 111320, dx = (a.lng - b.lng) * k, dy = (a.lat - b.lat) * 110540; return Math.sqrt(dx * dx + dy * dy); };
+function addrBest(e) {
+  let best = null;
+  for (const p of e.pts || []) {
+    const grp = (e.pts || []).filter((o) => addrDist(o, p) <= 100), w = grp.reduce((n, o) => n + o.w, 0);
+    if (!best || w > best.w) { const sw = grp.reduce((n, o) => n + o.w, 0) || 1; best = { w, lat: grp.reduce((n, o) => n + o.lat * o.w, 0) / sw, lng: grp.reduce((n, o) => n + o.lng * o.w, 0) / sw }; }
+  }
+  return best && best.w >= 2 ? { lat: +best.lat.toFixed(6), lng: +best.lng.toFixed(6), w: best.w } : null;   // un ajuste del pasajero (3) o dos llegadas (1+1)
+}
+app.post('/api/addr/verify', (req, res) => {
+  const b = req.body || {}, key = String(b.key || ''), lat = Number(b.lat), lng = Number(b.lng), kind = b.kind === 'adjust' ? 'adjust' : 'arrival';
+  if (!ADDR_KEY.test(key) || !Number.isFinite(lat) || !Number.isFinite(lng) || lat < -36 || lat > -33.5 || lng < -60 || lng > -57) return res.status(400).json({ ok: false });
+  const ip = String(req.ip || ''), now = Date.now(), r = addrRate.get(ip) || { n: 0, t: now };
+  if (now - r.t > 3600_000) { r.n = 0; r.t = now; } if (++r.n > 60) return res.status(429).json({ ok: false }); addrRate.set(ip, r);
+  if (addrRate.size > 5000) addrRate.delete(addrRate.keys().next().value);
+  const e = addrMem.get(key) || { label: '', pts: [], at: now };
+  e.label = String(b.label || e.label || '').slice(0, 160); e.at = now;
+  e.pts.push({ lat, lng, w: kind === 'adjust' ? 3 : 1, at: now }); if (e.pts.length > 14) e.pts.splice(0, e.pts.length - 14);
+  addrMem.set(key, e); if (addrMem.size > 20000) addrMem.delete(addrMem.keys().next().value);
+  kvSet('addr', key, e);
+  res.json({ ok: true, verified: !!addrBest(e) });
+});
+app.post('/api/addr/find', (req, res) => {
+  const q = String((req.body || {}).q || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').slice(0, 60).trim();
+  if (q.length < 3) return res.json({ ok: true, items: [] });
+  const items = [];
+  for (const [k, e] of addrMem) { if (!k.startsWith(q + '|')) continue; const b = addrBest(e); if (b) items.push({ key: k, label: e.label, lat: b.lat, lng: b.lng, w: b.w }); if (items.length >= 5) break; }
+  res.json({ ok: true, items });
+});
+
 app.post('/api/proof/get', async (req, res) => {
   const b = req.body || {}, key = String(b.tripKey || ''), kind = String(b.kind || '');
   if (!/^[A-Za-z0-9]{6,30}$/.test(key) || (kind !== 'proof' && kind !== 'delivery')) return res.status(400).json({ ok: false, error: 'bad_request' });
