@@ -921,8 +921,8 @@ function fEligible(r) {
   return el;
 }
 /* V486 · 1° chofer fundador (dueño de MOBI): se reconoce por DNI o teléfono. Fijo, no ocupa cupo, no se puede quitar. */
-const FIRST_DNI = '28098817', FIRST_PH = '1164634473';
-function fFirst(el) { const x = el.find((e) => e.dni === FIRST_DNI || (e.ph && e.ph.slice(-10) === FIRST_PH)); return x ? x.id : ''; }
+const FIRST_DNI = '28098817', FIRST_PH8 = '64634473';   /* teléfono: últimos 8 dígitos (sirve con 11… o 15…) */
+function fFirst(el) { const x = el.find((e) => e.dni === FIRST_DNI || (e.ph && e.ph.slice(-8) === FIRST_PH8)); return x ? x.id : ''; }
 function founderPublish(r, ids, removed, cfg, total, first) {
   first = first || '';
   if (first) { ids = Object.assign({}, ids, { [first]: 1 }); removed = Object.assign({}, removed); delete removed[first]; }
