@@ -102,6 +102,7 @@ async function dbInit() {
     for (const row of w.rows) waVerified.set(row.id, row.data);
     try { const g = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'wacfg' AND id = 'regblock'`); if (g.rows[0]) waRegBlockUntil = Number(g.rows[0].data.until) || 0; } catch (e) {}
     dbState = 'on';
+    histLoad().catch(() => {});
     console.log(`Base de datos conectada: ${r.rows.length} registros, ${w.rows.length} verificaciones`);
   } catch (e) {
     dbState = 'error'; dbError = e.message; db = null; pushLoaded = true;
@@ -110,7 +111,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'refund-req', 'cfg-push']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -185,6 +186,7 @@ function pushMessage(room, m) {
   } else if ((msg.type === 'driver-pos' || msg.type === 'pax-pos' || msg.type === 'pay-proof' || msg.type === 'pay-proof-meta') && msg.data && msg.data.tripKey) { msg.tk = String(msg.data.tripKey); msg.priv = 'pos'; }
   else if (msg.type === 'chat' && msg.data && msg.data.tk) { msg.tk = String(msg.data.tk); msg.priv = 'pos'; if (!msg.key && msg.data.m && msg.data.m.id) msg.key = 'ch:' + String(msg.data.m.id).slice(0, 60); }   /* V469 · comprobantes y chat: solo a los dos del viaje (y al administrador) */
   if (msg.type === 'drv-pres' && msg.data && msg.data.id && msg.data.online !== false) { if (!room.seen) room.seen = new Map(); room.seen.set(String(msg.data.id), Date.now()); }   /* V473 · última vez conectado (para el cupo) */
+  try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}   /* V485 · historial de conductores (viajes y conexiones) */
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
@@ -223,7 +225,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -240,7 +242,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -900,6 +902,121 @@ app.post('/api/admin/cupo-notified', (req, res) => {
   const r = getRoom(b.room), m = r.sticky.get('drv-slots|slots'), id = String(b.id || '');
   if (m && m.data && m.data.notify && m.data.notify[id]) { const d = Object.assign({}, m.data, { notify: Object.assign({}, m.data.notify) }); delete d.notify[id]; r._cupoSig = ''; pushMessage(r, { type: 'drv-slots', key: 'slots', src: 'server', data: d }); }
   res.json({ ok: true });
+});
+
+
+/* ---------------- V484 · CHOFERES FUNDADORES ----------------
+   Los primeros N conductores aprobados (por fecha de registro) quedan como fundadores: sin comisión y sin deuda con MOBI.
+   El administrador puede quitar a uno (su lugar pasa al siguiente) o sumar a mano. Un fundador quitado no vuelve solo. */
+function fCfg(r) { const m = r.sticky.get('cfg-founder|cfg:founder'); const d = (m && m.data) || {}; const cap = Math.floor(Number(d.cap)); const mp = Number(d.mp); return { cap: Number.isFinite(cap) ? Math.min(500, Math.max(0, cap)) : 30, auto: d.auto === undefined ? 1 : (d.auto ? 1 : 0), mp: Number.isFinite(mp) ? Math.min(30, Math.max(0, Math.round(mp * 100) / 100)) : 0 }; }
+function fState(r) { const m = r.sticky.get('drv-founders|founders'); const d = (m && m.data) || {}; return { ids: Object.assign({}, d.ids), removed: Object.assign({}, d.removed) }; }
+function fEligible(r) {
+  const el = [];
+  for (const m of r.sticky.values()) {
+    if (!m || m.type !== 'driver-reg' || !m.data) continue; const d = m.data;
+    if (d.status !== 'aprobado' || d.hiddenAt || d.deletedAt || !d.id) continue;
+    el.push({ id: String(d.id), t: Number(d.registeredAt) || Number(d.submittedAt) || Number(d.reviewedAt) || 0, dni: String(d.dni || '').replace(/\D/g, ''), ph: String(d.phone || '').replace(/\D/g, '') });
+  }
+  el.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+  return el;
+}
+/* V486 · 1° chofer fundador (dueño de MOBI): se reconoce por DNI o teléfono. Fijo, no ocupa cupo, no se puede quitar. */
+const FIRST_DNI = '28098817', FIRST_PH = '1164634473';
+function fFirst(el) { const x = el.find((e) => e.dni === FIRST_DNI || (e.ph && e.ph.slice(-10) === FIRST_PH)); return x ? x.id : ''; }
+function founderPublish(r, ids, removed, cfg, total, first) {
+  first = first || '';
+  if (first) { ids = Object.assign({}, ids, { [first]: 1 }); removed = Object.assign({}, removed); delete removed[first]; }
+  const sig = JSON.stringify([Object.keys(ids).sort(), Object.keys(removed).sort(), cfg.cap, cfg.auto, cfg.mp, first]);
+  if (r._fSig === sig) return false; r._fSig = sig;
+  pushMessage(r, { type: 'drv-founders', key: 'founders', src: 'server', data: { ids, removed, cap: cfg.cap, auto: cfg.auto, mp: cfg.mp, total, first, at: Date.now() } });
+  return true;
+}
+function founderCompute(r) {
+  const cfg = fCfg(r), st = fState(r), el = fEligible(r), now = Date.now(), ok = new Set(el.map((x) => x.id));
+  const ids = {}, removed = Object.assign({}, st.removed), first = fFirst(el);
+  for (const k of Object.keys(st.ids)) if (ok.has(k) && !removed[k] && k !== first) ids[k] = st.ids[k];   /* los que ya son fundadores se conservan (aunque se baje el cupo) */
+  let n = Object.keys(ids).length;
+  if (cfg.auto) for (const x of el) { if (n >= cfg.cap) break; if (x.id === first || ids[x.id] || removed[x.id]) continue; ids[x.id] = now; n++; }
+  founderPublish(r, ids, removed, cfg, el.length, first);
+}
+setInterval(() => { for (const r of rooms.values()) { try { founderCompute(r); } catch (e) { console.warn('founder', e.message); } } }, 30_000).unref();
+app.post('/api/admin/founder-cfg', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), n = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+  const data = { cap: Math.floor(n(b.cap, 0, 500, 30)), auto: b.auto ? 1 : 0, mp: Math.round(n(b.mp, 0, 30, 0) * 100) / 100, at: Date.now() };
+  pushMessage(r, { type: 'cfg-founder', key: 'cfg:founder', src: 'admin', data });
+  founderCompute(r);
+  console.log('Fundadores config', JSON.stringify(data));
+  res.json({ ok: true, data });
+});
+app.post('/api/admin/founder-set', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), id = String(b.id || ''), cfg = fCfg(r), st = fState(r), el = fEligible(r);
+  if (!id || !el.some((x) => x.id === id)) return res.status(404).json({ ok: false, error: 'driver' });
+  const first = fFirst(el); if (id === first) return res.status(409).json({ ok: false, error: 'first' });
+  const ids = Object.assign({}, st.ids), removed = Object.assign({}, st.removed); if (first) delete ids[first];
+  if (b.on) {
+    if (!ids[id] && Object.keys(ids).length >= cfg.cap) return res.status(409).json({ ok: false, error: 'full', cap: cfg.cap });
+    ids[id] = ids[id] || Date.now(); delete removed[id];
+  } else { delete ids[id]; removed[id] = Date.now(); }
+  r._fSig = '';
+  founderPublish(r, ids, removed, cfg, el.length, first);
+  founderCompute(r);   /* si sobra lugar y está el automático, pasa al siguiente */
+  console.log('Fundador', id, b.on ? 'sumado' : 'quitado');
+  res.json({ ok: true });
+});
+
+
+/* ---------------- V485 · HISTORIAL DE CONDUCTORES para el administrador (viajes con recorrido + horarios de conexión) ----------------
+   Se guarda aparte de los mensajes del bus (que se limpian a los 3 días): un registro corto por viaje y por sesión conectada. */
+const dHist = new Map(), dSess = new Map(), dDirty = new Set();
+const HK = (room, id) => (typeof room === 'string' ? room : room.name) + '|' + String(id);
+function histIngest(room, msg) {
+  const d = msg.data; if (!d || !Array.isArray(d.hist)) return;
+  const it = (d.hist.find((h) => h && h.role === 'drv') || {}).item; if (!it || !it.driverId) return;
+  const k = HK(room, it.driverId), l = dHist.get(k) || [], id = String((d.ledger && d.ledger.tripId) || it.id || '');
+  if (!id || l.some((x) => x.id === id)) return;
+  l.push({ id, at: Number(it.at) || Date.now(), route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), fare: Number(it.fare) || 0, net: Number(it.net) || 0, fee: Number(it.fee) || 0, payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), pax: String(it.other || '').slice(0, 60), plate: String((d.ledger && d.ledger.plate) || it.plate || '').slice(0, 12) });
+  if (l.length > 1500) l.splice(0, l.length - 1500);
+  dHist.set(k, l); dDirty.add('dhist|' + k);
+}
+function presIngest(room, msg) {
+  const d = msg.data; if (!d || !d.id) return;
+  const k = HK(room, d.id), now = Date.now(), s = dSess.get(k) || { list: [], cur: null }, online = d.online !== false;
+  if (online) {
+    if (s.cur && now - s.cur.last <= 4 * 60_000) s.cur.last = now;
+    else { if (s.cur) s.list.push({ from: s.cur.from, to: s.cur.last }); s.cur = { from: now, last: now }; }
+  } else if (s.cur) { s.list.push({ from: s.cur.from, to: now }); s.cur = null; }
+  if (s.list.length > 400) s.list.splice(0, s.list.length - 400);
+  dSess.set(k, s); dDirty.add('dsess|' + k);
+}
+async function histFlush() {
+  if (!dDirty.size) return; const keys = [...dDirty]; dDirty.clear();
+  for (const x of keys) { const i = x.indexOf('|'), ns = x.slice(0, i), k = x.slice(i + 1); try { await kvSet(ns, k, ns === 'dhist' ? { list: dHist.get(k) || [] } : (dSess.get(k) || { list: [], cur: null })); } catch (e) { dDirty.add(x); } }
+}
+setInterval(() => { histFlush().catch(() => {}); }, 45_000).unref();
+async function histLoad() {
+  if (!db) return;
+  try { const r = await db.query(`SELECT ns, id, data FROM mobi_kv WHERE ns IN ('dhist','dsess')`); for (const row of r.rows) { if (row.ns === 'dhist') dHist.set(row.id, (row.data && row.data.list) || []); else dSess.set(row.id, row.data || { list: [], cur: null }); } console.log('Historial de conductores cargado:', dHist.size, 'con viajes,', dSess.size, 'con conexiones'); } catch (e) { console.warn('histLoad', e.message); }
+}
+app.post('/api/admin/driver-history', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), id = String(b.id || ''); if (!id) return res.status(400).json({ ok: false, error: 'id' });
+  const k = HK(r, id), seen = new Set(), trips = [];
+  for (const x of (dHist.get(k) || [])) { seen.add(x.id); trips.push(x); }
+  for (const m of r.sticky.values()) {   /* viajes que todavía están en el bus y no se anotaron (anteriores a esta versión) */
+    if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist)) continue;
+    const it = (m.data.hist.find((h) => h && h.role === 'drv') || {}).item; if (!it || String(it.driverId) !== id) continue;
+    const tid = String((m.data.ledger && m.data.ledger.tripId) || it.id || ''); if (!tid || seen.has(tid)) continue; seen.add(tid);
+    trips.push({ id: tid, at: Number(it.at) || m.at, route: String(it.route || ''), stop: String(it.stop || ''), fare: Number(it.fare) || 0, net: Number(it.net) || 0, fee: Number(it.fee) || 0, payment: String(it.payment || ''), status: String(it.status || ''), pax: String(it.other || ''), plate: String((m.data.ledger && m.data.ledger.plate) || it.plate || '') });
+  }
+  trips.sort((a, c) => c.at - a.at);
+  const s = dSess.get(k) || { list: [], cur: null }, now = Date.now();
+  const sessions = s.list.slice(-200).concat(s.cur ? [{ from: s.cur.from, to: s.cur.last, live: now - s.cur.last < 60_000 }] : []).reverse();
+  res.json({ ok: true, trips: trips.slice(0, 500), totalTrips: trips.length, sessions: sessions.slice(0, 200), seenAt: Number(r.seen && r.seen.get(id)) || 0 });
 });
 
 /* V445 · política de deuda (límite, % mínimo, alias de cobro) · solo administrador (se reparte a todos por el bus) */
