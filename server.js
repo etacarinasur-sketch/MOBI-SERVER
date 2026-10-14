@@ -1137,6 +1137,18 @@ app.post('/api/admin/push-stats', (req, res) => {
   const r = getRoom(b.room), drv = pushDrivers(r), subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
   res.json({ ok: true, drivers: drv.size, subscribed: [...drv.keys()].filter((id) => subs.has(id)).length, cfg: pushCfg(r) });
 });
+/* V480 · prueba de aviso en el celular del administrador (no cuenta como conductor ni recibe avisos masivos) */
+app.post('/api/admin/push-self', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  if (!pushLoaded) return res.status(503).json({ ok: false });
+  const ep = String((b.sub && b.sub.endpoint) || ''); let host = ''; try { const u = new URL(ep); if (u.protocol === 'https:') host = u.hostname; } catch (e) {}
+  if (!host || ep.length > 700 || !pushHost.test(host)) return res.status(400).json({ ok: false, error: 'sub' });
+  const rm = /^[a-zA-Z0-9_-]{1,40}$/.test(String(b.room || '')) ? String(b.room) : 'pilot', h = pushHash(ep), item = { endpoint: ep, uid: 'adm_test', room: rm, at: Date.now() };
+  pushSubs.set(h, item); kvSet('push', h, item);
+  const n = pushNotify('adm_test', { title: '✅ Los avisos funcionan', body: 'Así le llega un aviso de MOBI a un conductor, aunque la app esté cerrada.' });
+  res.json({ ok: true, sent: n });
+});
+
 app.post('/api/admin/push-send', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const title = String(b.title || '').trim().slice(0, 80), body = String(b.body || '').trim().slice(0, 200), aud = ['all', 'recent', 'offline'].includes(b.audience) ? b.audience : 'all';
