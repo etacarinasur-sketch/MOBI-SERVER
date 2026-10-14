@@ -1488,12 +1488,15 @@ app.post('/api/account/find', async (req, res) => {
     else if (tail8(d.phone) !== v.tail) continue;
     const when = Number(d.upd || d.updatedAt || m.at || 0);
     if (m.type === 'pax-reg' && (!pax || when > pax._w)) pax = Object.assign({}, d, { _w: when });
-    if (m.type === 'driver-reg' && !d.hiddenAt && (!drv || when > drv._w)) drv = Object.assign({}, d, { _w: when });
+    if (m.type === 'driver-reg' && !d.hiddenAt) {   /* V496 · entre varios registros del mismo celular se elige el mejor estado (aprobado > pendiente > sin enviar > rechazado) y, a igual estado, el más reciente */
+      const rk = { aprobado: 4, pendiente: 3, borrador: 2, rechazado: 1 }[String(d.status || 'borrador')] || 2;
+      if (!drv || rk > drv._r || (rk === drv._r && when > drv._w)) drv = Object.assign({}, d, { _w: when, _r: rk });
+    }
   }
   let drvDocs = null;
   if (drv && drv.id) drvDocs = await docsOf(drv.id);
-  if (pax) delete pax._w; if (drv) delete drv._w;
-  console.log('Recuperar cuenta · …' + v.tail.slice(-4), pax ? 'pasajero' : '', drv ? 'conductor' : '');
+  if (pax) delete pax._w; if (drv) { delete drv._w; delete drv._r; }
+  console.log('Recuperar cuenta · …' + v.tail.slice(-4), 'vía ' + (v.via || '?'), pax ? 'pasajero' : '', drv ? 'conductor(' + String(drv.status || 'borrador') + ')' : '');
   res.json({ ok: true, pax, drv, drvDocs });
 });
 
