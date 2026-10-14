@@ -848,12 +848,14 @@ function cupoWaiting(r, id) {
   const m = r.sticky.get('drv-slots|slots'); const d = m && m.data; if (!d || !(d.cupo > 0)) return false;
   return !(d.enabled && d.enabled[id]) && !!(d.known && d.known[id]);
 }
+/* V487 · un conductor oculto de la lista solo queda afuera si no se reenvió después de ocultarlo (igual que la app) */
+const drvHidden = (d) => !!(d.hiddenAt && !(Number(d.submittedAt || 0) > Number(d.hiddenAt)));
 function cupoCompute(r) {
   const cfg = cupoCfg(r), st = cupoState(r), now = Date.now(), dayMs = 86400000;
   const el = [];
   for (const m of r.sticky.values()) {
     if (!m || m.type !== 'driver-reg' || !m.data) continue; const d = m.data;
-    if (d.status !== 'aprobado' || d.hiddenAt || d.deletedAt || !d.id) continue;
+    if (d.status !== 'aprobado' || drvHidden(d) || d.deletedAt || !d.id) continue;
     el.push({ id: String(d.id), t: Number(st.lapsed[d.id]) || Number(d.registeredAt) || Number(d.submittedAt) || Number(d.reviewedAt) || 0 });
   }
   el.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
@@ -914,7 +916,7 @@ function fEligible(r) {
   const el = [];
   for (const m of r.sticky.values()) {
     if (!m || m.type !== 'driver-reg' || !m.data) continue; const d = m.data;
-    if (d.status !== 'aprobado' || d.hiddenAt || d.deletedAt || !d.id) continue;
+    if (d.status !== 'aprobado' || drvHidden(d) || d.deletedAt || !d.id) continue;
     el.push({ id: String(d.id), t: Number(d.registeredAt) || Number(d.submittedAt) || Number(d.reviewedAt) || 0, dni: String(d.dni || '').replace(/\D/g, ''), ph: String(d.phone || '').replace(/\D/g, '') });
   }
   el.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
@@ -939,7 +941,7 @@ function founderCompute(r) {
   if (cfg.auto) for (const x of el) { if (n >= cfg.cap) break; if (x.id === first || ids[x.id] || removed[x.id]) continue; ids[x.id] = now; n++; }
   founderPublish(r, ids, removed, cfg, el.length, first);
   try {   /* diagnóstico: una línea en el log cada vez que cambia algo */
-    const by = {}; for (const m of r.sticky.values()) if (m && m.type === 'driver-reg' && m.data) by[m.data.status || '?'] = (by[m.data.status || '?'] || 0) + 1;
+    const by = {}; for (const m of r.sticky.values()) if (m && m.type === 'driver-reg' && m.data) { const k = m.data.status || '?'; by[k] = (by[k] || 0) + 1; if (k === 'aprobado' && !el.some((x) => x.id === String(m.data.id))) by.aprobado_excluido = (by.aprobado_excluido || 0) + 1; }
     const sg = JSON.stringify([by, el.length, Object.keys(ids).length, first]);
     if (r._fLog !== sg) { r._fLog = sg; console.log('Fundadores [' + r.name + '] conductores por estado ' + JSON.stringify(by) + ' · elegibles ' + el.length + ' · fundadores ' + Object.keys(ids).length + ' · primero ' + (first || 'no'));  }
   } catch (e) {}
@@ -1210,7 +1212,7 @@ function pushDrivers(r) {   // conductores aprobados con lugar: id -> { present,
   const out = new Map(), now = Date.now();
   for (const m of r.sticky.values()) {
     if (!m || m.type !== 'driver-reg' || !m.data || !m.data.id) continue;
-    const d = m.data; if (d.status !== 'aprobado' || d.hiddenAt || d.deletedAt) continue;
+    const d = m.data; if (d.status !== 'aprobado' || drvHidden(d) || d.deletedAt) continue;
     const id = String(d.id); if (cupoWaiting(r, id)) continue;
     const p = r.sticky.get('drv-pres|dpres:' + id), present = !!(p && p.data && p.data.online !== false && now - p.at < 90000);
     out.set(id, { present, seenAt: Number(r.seen && r.seen.get(id)) || 0 });
