@@ -111,7 +111,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -225,7 +225,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -242,7 +242,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -1114,6 +1114,9 @@ function histIngest(room, msg) {
   l.push({ id, at: Number(it.at) || Date.now(), route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), fare: Number(it.fare) || 0, net: Number(it.net) || 0, fee: Number(it.fee) || 0, payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), pax: String(it.other || '').slice(0, 60), plate: String((d.ledger && d.ledger.plate) || it.plate || '').slice(0, 12) });
   if (l.length > 1500) l.splice(0, l.length - 1500);
   dHist.set(k, l); dDirty.add('dhist|' + k);
+  /* V495 · viajes por pasajero (para el buscador de Administración) */
+  const pid = String(it.paxId || (d.sum && d.sum.paxId) || '');
+  if (pid) { const pk = HK(room, 'p:' + pid), pl = dHist.get(pk) || []; if (!pl.some((x) => x.id === id)) { pl.push({ id, at: Number(it.at) || Date.now(), fare: Number(it.fare) || 0 }); if (pl.length > 1500) pl.splice(0, pl.length - 1500); dHist.set(pk, pl); dDirty.add('dhist|' + pk); } }
 }
 function presIngest(room, msg) {
   const d = msg.data; if (!d || !d.id) return;
@@ -1150,6 +1153,40 @@ app.post('/api/admin/driver-history', (req, res) => {
   const s = dSess.get(k) || { list: [], cur: null }, now = Date.now();
   const sessions = s.list.slice(-200).concat(s.cur ? [{ from: s.cur.from, to: s.cur.last, live: now - s.cur.last < 60_000 }] : []).reverse();
   res.json({ ok: true, trips: trips.slice(0, 500), totalTrips: trips.length, sessions: sessions.slice(0, 200), seenAt: Number(r.seen && r.seen.get(id)) || 0 });
+});
+
+/* V495 · estadísticas de usuarios para el buscador de Administración (viajes por conductor y por pasajero) */
+app.post('/api/admin/user-stats', (req, res) => {
+  const bd = req.body || {};
+  if (!adminOk(bd.token) && !sbxOk(bd)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(bd.room), out = { drv: {}, pax: {} };
+  const ids = (a) => (Array.isArray(a) ? a : []).map((x) => String(x || '')).filter(Boolean).slice(0, 2000);
+  const seenT = new Set();
+  const add = (kind, id, tid, at) => { const o = out[kind][id] || (out[kind][id] = { trips: 0, last: 0 }); o.trips++; if (at > o.last) o.last = at; seenT.add(kind + '|' + id + '|' + tid); };
+  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) add('drv', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) add('pax', id, x.id, Number(x.at) || 0);
+  const wantD = new Set(ids(bd.drv)), wantP = new Set(ids(bd.pax));
+  for (const m of r.sticky.values()) {   /* viajes que todavía están en el bus y no se anotaron */
+    if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist)) continue;
+    const tid = String((m.data.ledger && m.data.ledger.tripId) || '');
+    for (const h of m.data.hist) { const it = h && h.item; if (!it) continue; const t2 = tid || String(it.id || '').replace(/[dp]$/, ''), at = Number(it.at) || m.at;
+      if (it.driverId && wantD.has(String(it.driverId)) && !seenT.has('drv|' + it.driverId + '|' + t2)) add('drv', String(it.driverId), t2, at);
+      if (it.paxId && wantP.has(String(it.paxId)) && !seenT.has('pax|' + it.paxId + '|' + t2)) add('pax', String(it.paxId), t2, at); }
+  }
+  for (const id of wantD) { const o = out.drv[id]; if (o) o.seen = Number(r.seen && r.seen.get(id)) || 0; else out.drv[id] = { trips: 0, last: 0, seen: Number(r.seen && r.seen.get(id)) || 0 }; }
+  res.json({ ok: true, stats: out });
+});
+
+/* V495 · MODO MANTENIMIENTO · lo activa el administrador y lo ve cualquier dispositivo (se reparte por el bus y se consulta por GET) */
+function maintGet(roomName) { const m = getRoom(roomName).sticky.get('cfg-maint|cfg:maint'); const d = m && m.data; return d && d.on ? { on: true, msg: String(d.msg || ''), eta: String(d.eta || ''), at: Number(d.at) || 0 } : { on: false, msg: '', eta: '', at: Number(d && d.at) || 0 }; }
+app.get('/api/maint', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(Object.assign({ ok: true, serverTime: Date.now() }, maintGet(req.query.room))); });
+app.post('/api/admin/maint', (req, res) => {
+  const bd = req.body || {};
+  if (!adminOk(bd.token) && !sbxOk(bd)) return res.status(401).json({ ok: false, error: 'admin' });
+  const data = { on: !!bd.on, msg: String(bd.msg || '').trim().slice(0, 240), eta: String(bd.eta || '').trim().slice(0, 60), at: Date.now() };
+  const saved = pushMessage(getRoom(bd.room), { type: 'cfg-maint', key: 'cfg:maint', src: 'admin', data });
+  console.log('Modo mantenimiento', data.on ? 'ACTIVADO' : 'desactivado');
+  res.json({ ok: true, data, id: saved && saved.id });
 });
 
 /* V445 · política de deuda (límite, % mínimo, alias de cobro) · solo administrador (se reparte a todos por el bus) */
