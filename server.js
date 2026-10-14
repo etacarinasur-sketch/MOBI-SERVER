@@ -994,6 +994,7 @@ let pushLastDirty = false;
 const pushSubs = new Map();         // hash(endpoint) -> { endpoint, uid, at }
 const pushQueue = new Map();        // hash(endpoint) -> [{ title, body, url, at }]
 const pushRate = new Map();
+let pushLastStatus = null;
 const pushHost = /(^|\.)(googleapis\.com|push\.services\.mozilla\.com|push\.apple\.com|notify\.windows\.com)$/i;
 const b64u = (b) => Buffer.from(b).toString('base64url');
 const pushHash = (ep) => crypto.createHash('sha256').update(String(ep)).digest('hex').slice(0, 40);
@@ -1018,15 +1019,16 @@ async function pushTouch(h, sub) {
     const r = await fetch(sub.endpoint, { method: 'POST', headers: { TTL: '86400', Urgency: 'high', 'Content-Length': '0', Authorization: 'vapid t=' + pushJwt(u.origin) + ', k=' + pushPub } });
     if (r.status === 404 || r.status === 410) { pushSubs.delete(h); pushQueue.delete(h); if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]).catch(() => {}); }
     else if (!r.ok) console.warn('Push', r.status);
-    return r.ok;
-  } catch (e) { console.warn('Push', e.message); return false; }
+    pushLastStatus = { status: r.status, at: Date.now() };
+    return { ok: r.ok, status: r.status };
+  } catch (e) { console.warn('Push', e.message); pushLastStatus = { status: 0, at: Date.now(), err: String(e.message || e).slice(0, 80) }; return { ok: false, status: 0 }; }
 }
-function pushNotify(uid, note) {
+function pushNotify(uid, note, acc) {
   if (note && note.skip) return 0; pushVapidEnsure(); if (!uid || !pushPriv) return 0; let n = 0;
   for (const [h, sub] of pushSubs) {
     if (String(sub.uid) !== String(uid)) continue;
     const q = pushQueue.get(h) || []; q.push({ title: String(note.title || 'MOBI').slice(0, 80), body: String(note.body || '').slice(0, 200), url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
-    pushTouch(h, sub); n++;
+    const pr = pushTouch(h, sub); if (acc) acc.push(pr); n++;
   }
   return n;
 }
@@ -1135,34 +1137,34 @@ app.post('/api/admin/push-cfg', (req, res) => {
 app.post('/api/admin/push-stats', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const r = getRoom(b.room), drv = pushDrivers(r), subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
-  res.json({ ok: true, drivers: drv.size, subscribed: [...drv.keys()].filter((id) => subs.has(id)).length, cfg: pushCfg(r) });
+  res.json({ ok: true, last: pushLastStatus, drivers: drv.size, subscribed: [...drv.keys()].filter((id) => subs.has(id)).length, cfg: pushCfg(r) });
 });
 /* V480 · prueba de aviso en el celular del administrador (no cuenta como conductor ni recibe avisos masivos) */
-app.post('/api/admin/push-self', (req, res) => {
+app.post('/api/admin/push-self', async (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   if (!pushLoaded) return res.status(503).json({ ok: false });
   const ep = String((b.sub && b.sub.endpoint) || ''); let host = ''; try { const u = new URL(ep); if (u.protocol === 'https:') host = u.hostname; } catch (e) {}
   if (!host || ep.length > 700 || !pushHost.test(host)) return res.status(400).json({ ok: false, error: 'sub' });
   const rm = /^[a-zA-Z0-9_-]{1,40}$/.test(String(b.room || '')) ? String(b.room) : 'pilot', h = pushHash(ep), item = { endpoint: ep, uid: 'adm_test', room: rm, at: Date.now() };
   pushSubs.set(h, item); kvSet('push', h, item);
-  const n = pushNotify('adm_test', { title: '✅ Los avisos funcionan', body: 'Así le llega un aviso de MOBI a un conductor, aunque la app esté cerrada.' });
-  res.json({ ok: true, sent: n });
+  const acc = [], n = pushNotify('adm_test', { title: '✅ Los avisos funcionan', body: 'Así le llega un aviso de MOBI a un conductor, aunque la app esté cerrada.' }, acc);
+  const rs = await Promise.all(acc); res.json({ ok: true, sent: n, accepted: rs.filter((x) => x.ok).length, codes: rs.map((x) => x.status) });
 });
 
-app.post('/api/admin/push-send', (req, res) => {
+app.post('/api/admin/push-send', async (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const title = String(b.title || '').trim().slice(0, 80), body = String(b.body || '').trim().slice(0, 200), aud = ['all', 'recent', 'offline'].includes(b.audience) ? b.audience : 'all';
   if (!title || !body) return res.status(400).json({ ok: false, error: 'texto' });
   if (!pushLoaded) return res.status(503).json({ ok: false });
-  const r = getRoom(b.room), drv = pushDrivers(r), now = Date.now(); let n = 0;
+  const r = getRoom(b.room), drv = pushDrivers(r), now = Date.now(), acc = []; let n = 0;
   const subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
   for (const [id, x] of drv) {
     if (!subs.has(id)) continue;
     if (aud === 'recent' && now - x.seenAt > 24 * 3600_000) continue;
     if (aud === 'offline' && x.present) continue;
-    if (pushNotify(id, { title, body })) n++;
+    if (pushNotify(id, { title, body }, acc)) n++;
   }
-  console.log('Aviso manual enviado a', n, 'conductores'); res.json({ ok: true, sent: n, eligible: drv.size });
+  const rs = await Promise.all(acc); console.log('Aviso manual enviado a', n, 'conductores · aceptados por el servicio:', rs.filter((x) => x.ok).length); res.json({ ok: true, sent: n, eligible: drv.size, accepted: rs.filter((x) => x.ok).length, codes: rs.map((x) => x.status) });
 });
 
 app.post('/api/addr/find', (req, res) => {
