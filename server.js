@@ -654,7 +654,7 @@ async function waRegister() {                                   // error 133010:
     });
     const t = (await r.text()).slice(0, 300);
     console.log('WA register', r.status, t);
-    if (r.ok) await waSubscribe();
+    if (r.ok) { waReady = true; await waSubscribe(); }
     else waBlockRegister(/133016/.test(t) ? 24 * 3600_000 : 30 * 60_000);
     return r.ok;
   } catch (e) { console.warn('WA register', e.message); return false; }
@@ -686,6 +686,7 @@ async function waAutoSetup() {
     if (WA_PHONE_ID && !WA_IS_TEST) {
       const st = await waGraph(`${WA_PHONE_ID}?fields=display_phone_number,verified_name,name_status,status,platform_type`);
       console.log('WA estado del número', st.status, JSON.stringify(st.j).slice(0, 300));
+      if (st.ok && String(st.j.platform_type || '').toUpperCase() === 'CLOUD_API') waReady = true;
       if (st.ok && String(st.j.platform_type || '').toUpperCase() !== 'CLOUD_API') await waRegister();
     }
   } catch (e) { console.warn('WA autosetup', e.message); }
@@ -726,7 +727,7 @@ app.post('/api/wa/start', async (req, res) => {
 });
 app.get('/api/wa/status', (req, res) => {
   const v = waVerified.get(String(req.query.userId || ''));
-  res.json({ ok: true, verified: Boolean(v), at: v ? v.at : null });
+  res.json({ ok: true, verified: Boolean(v), at: v ? v.at : null, via: v ? (v.via || 'wa') : null, email: v && v.email || null });
 });
 app.get('/api/wa/webhook', (req, res) => {
   if (WA_VERIFY_TOKEN && req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === WA_VERIFY_TOKEN) return res.status(200).send(String(req.query['hub.challenge'] || ''));
@@ -775,6 +776,131 @@ app.post('/api/wa/webhook', (req, res) => {
     }
   } catch (e) { console.warn('WA webhook', e.message); }
 });
+
+/* ---------------- V494 · verificación sin Meta: Telegram (teléfono) y mail (Gmail API) ----------------
+   Las dos dejan al usuario en waVerified igual que WhatsApp, así /api/wa/status y /api/account/find siguen igual.
+   Se activan solas cuando están cargadas las variables en Render:
+     Telegram: TG_BOT_TOKEN
+     Mail:     GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN  (opcional GMAIL_FROM_NAME) */
+const TG_TOKEN = String(process.env.TG_BOT_TOKEN || '').trim();
+const TG_API = String(process.env.TG_API_BASE || 'https://api.telegram.org').replace(/\/$/, '');
+const TG_SECRET = TG_TOKEN ? crypto.createHash('sha256').update('mobi-tg|' + TG_TOKEN).digest('hex').slice(0, 40) : '';
+let tgUser = '';
+const tgPending = new Map();   // token -> { userId, tail, at }
+const tgChat = new Map();      // chatId -> token
+async function tgCall(method, body) {
+  const r = await fetch(`${TG_API}/bot${TG_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  return j;
+}
+async function tgSetup() {
+  if (!TG_TOKEN) return;
+  try {
+    const me = await tgCall('getMe');
+    if (!me.ok) { console.log('Telegram: el token no funciona', JSON.stringify(me).slice(0, 160)); return; }
+    tgUser = String(me.result.username || '');
+    const base = String(process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+    if (!base) { console.log('Telegram: falta la dirección pública del servidor (PUBLIC_URL)'); return; }
+    const w = await tgCall('setWebhook', { url: base + '/api/tg/webhook', secret_token: TG_SECRET, allowed_updates: ['message'], drop_pending_updates: true });
+    console.log('Telegram listo · bot @' + tgUser, '· webhook', w.ok ? 'ok' : JSON.stringify(w).slice(0, 160));
+  } catch (e) { console.warn('Telegram setup', e.message); }
+}
+setTimeout(tgSetup, 4000);
+app.post('/api/tg/start', (req, res) => {
+  const b = req.body || {}, userId = String(b.userId || '').slice(0, 60), tail = tail8(b.phone);
+  if (!userId || tail.length < 8) return res.status(400).json({ ok: false, error: 'bad_input' });
+  if (!TG_TOKEN || !tgUser) return res.json({ ok: true, configured: false });
+  for (const [t, v] of tgPending) if (v.userId === userId) tgPending.delete(t);
+  const token = crypto.randomBytes(12).toString('base64url');
+  tgPending.set(token, { userId, tail, at: Date.now() });
+  res.json({ ok: true, configured: true, link: `https://t.me/${tgUser}?start=${token}` });
+});
+app.post('/api/tg/webhook', (req, res) => {
+  if (!TG_TOKEN || req.get('x-telegram-bot-api-secret-token') !== TG_SECRET) return res.sendStatus(403);
+  res.sendStatus(200);
+  (async () => {
+    const m = (req.body && req.body.message) || null; if (!m || !m.chat) return;
+    const chat = m.chat.id, text = String(m.text || '');
+    if (/^\/start/.test(text)) {
+      const token = text.split(/\s+/)[1] || '';
+      if (!tgPending.has(token)) { await tgCall('sendMessage', { chat_id: chat, text: 'Este link venció. Volvé a MOBI y tocá «Verificar con Telegram» otra vez.' }); return; }
+      tgChat.set(chat, token);
+      await tgCall('sendMessage', { chat_id: chat, text: '👋 Hola, soy el verificador de MOBI.\nTocá el botón de abajo «📱 Compartir mi número» para confirmar tu celular.', reply_markup: { keyboard: [[{ text: '📱 Compartir mi número', request_contact: true }]], one_time_keyboard: true, resize_keyboard: true } });
+      return;
+    }
+    if (m.contact) {
+      const token = tgChat.get(chat), p = token && tgPending.get(token);
+      if (!p) { await tgCall('sendMessage', { chat_id: chat, text: 'Este pedido venció. Volvé a MOBI y empezá de nuevo.', reply_markup: { remove_keyboard: true } }); return; }
+      if (!m.from || m.contact.user_id !== m.from.id) { await tgCall('sendMessage', { chat_id: chat, text: 'Tiene que ser tu propio número. Tocá el botón «📱 Compartir mi número».' }); return; }
+      if (tail8(m.contact.phone_number) !== p.tail) { await tgCall('sendMessage', { chat_id: chat, text: 'Este número no coincide con el que cargaste en MOBI. Revisalo en la app y probá de nuevo.', reply_markup: { remove_keyboard: true } }); return; }
+      tgPending.delete(token); tgChat.delete(chat);
+      const v = { tail: p.tail, at: Date.now(), via: 'tg' }; waVerified.set(p.userId, v); kvSet('wa', p.userId, v);
+      console.log('Telegram: número verificado · …' + p.tail.slice(-4));
+      await tgCall('sendMessage', { chat_id: chat, text: '✅ Número verificado. Ya podés volver a MOBI.', reply_markup: { remove_keyboard: true } });
+    }
+  })().catch((e) => console.warn('Telegram webhook', e.message));
+});
+setInterval(() => { const now = Date.now(); for (const [t, v] of tgPending) if (now - v.at > 30 * 60_000) tgPending.delete(t); for (const [c, t] of tgChat) if (!tgPending.has(t)) tgChat.delete(c); }, 5 * 60_000).unref();
+
+const GM_ID = String(process.env.GMAIL_CLIENT_ID || '').trim(), GM_SECRET = String(process.env.GMAIL_CLIENT_SECRET || '').trim(), GM_REFRESH = String(process.env.GMAIL_REFRESH_TOKEN || '').trim();
+const GM_TOKEN_URL = process.env.GMAIL_TOKEN_URL || 'https://oauth2.googleapis.com/token';
+const GM_API = String(process.env.GMAIL_API_BASE || 'https://gmail.googleapis.com').replace(/\/$/, '');
+const GM_ON = Boolean(GM_ID && GM_SECRET && GM_REFRESH);
+let gmAccess = { token: '', exp: 0 };
+async function gmToken() {
+  if (gmAccess.token && Date.now() < gmAccess.exp - 60_000) return gmAccess.token;
+  const r = await fetch(GM_TOKEN_URL, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: GM_ID, client_secret: GM_SECRET, refresh_token: GM_REFRESH, grant_type: 'refresh_token' }).toString() });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.access_token) throw new Error('gmail token ' + r.status + ' ' + JSON.stringify(j).slice(0, 120));
+  gmAccess = { token: j.access_token, exp: Date.now() + (Number(j.expires_in) || 3000) * 1000 }; return gmAccess.token;
+}
+async function gmSend(to, subject, html, text) {
+  const tok = await gmToken(), bd = 'mobi' + crypto.randomBytes(8).toString('hex'), name = process.env.GMAIL_FROM_NAME || 'MOBI';
+  const enc = (s) => '=?UTF-8?B?' + Buffer.from(s, 'utf8').toString('base64') + '?=';
+  const mime = [`From: ${enc(name)} <me>`, `To: ${to}`, `Subject: ${enc(subject)}`, 'MIME-Version: 1.0', `Content-Type: multipart/alternative; boundary="${bd}"`, '',
+    `--${bd}`, 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64', '', Buffer.from(text, 'utf8').toString('base64'),
+    `--${bd}`, 'Content-Type: text/html; charset="UTF-8"', 'Content-Transfer-Encoding: base64', '', Buffer.from(html, 'utf8').toString('base64'), `--${bd}--`, ''].join('\r\n');
+  const r = await fetch(`${GM_API}/gmail/v1/users/me/messages/send`, { method: 'POST', headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ raw: Buffer.from(mime, 'utf8').toString('base64url') }) });
+  if (!r.ok) throw new Error('gmail send ' + r.status + ' ' + (await r.text()).slice(0, 160));
+}
+const mailPending = new Map();   // userId -> { code, email, tail, at, tries }
+const mailRate = new Map();      // email -> [timestamps]
+let mailDay = { d: '', n: 0 };
+const okMailAddr = (e) => /^[^\s@<>"']{1,64}@[^\s@<>"']{1,190}\.[a-z]{2,}$/i.test(e);
+app.post('/api/mail/start', async (req, res) => {
+  const b = req.body || {}, userId = String(b.userId || '').slice(0, 60), email = String(b.email || '').trim().toLowerCase().slice(0, 200), tail = tail8(b.phone);
+  if (!userId || !okMailAddr(email)) return res.status(400).json({ ok: false, error: 'bad_email' });
+  if (!GM_ON) return res.json({ ok: true, configured: false });
+  const prev = mailPending.get(userId);
+  if (prev && Date.now() - prev.at < 55_000) return res.status(429).json({ ok: false, error: 'wait', retryInSec: Math.ceil((60_000 - (Date.now() - prev.at)) / 1000) });
+  const hist = (mailRate.get(email) || []).filter((t) => Date.now() - t < 3600_000);
+  if (hist.length >= 5) return res.status(429).json({ ok: false, error: 'too_many' });
+  const day = new Date().toISOString().slice(0, 10); if (mailDay.d !== day) mailDay = { d: day, n: 0 };
+  if (mailDay.n >= 400) return res.status(429).json({ ok: false, error: 'daily' });
+  const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  try {
+    await gmSend(email, `Tu código de MOBI: ${code}`,
+      `<div style="background:#eef6f4;padding:24px 12px"><div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:28px 24px;border-radius:18px;background:#06212d;color:#eafff8;text-align:center"><img src="https://mobi-c6uo.onrender.com/icon-192.png" width="72" height="72" alt="MOBI" style="display:block;margin:0 auto 10px;border-radius:16px"><h2 style="margin:0 0 4px;color:#20e0ad;letter-spacing:3px">MOBI</h2><p style="margin:0 0 18px;color:#9fc3cf;font-size:13px">Viajes y envíos</p><p style="margin:0 0 14px">Tu código para verificar tu cuenta es:</p><div style="font-size:36px;font-weight:900;letter-spacing:10px;background:#0a3a52;border-radius:12px;padding:16px 6px;color:#ffffff">${code}</div><p style="font-size:13px;color:#9fc3cf;margin:18px 0 0">Vence en 15 minutos.<br>Si no lo pediste vos, ignorá este mail.</p></div></div>`,
+      `Tu código de MOBI es ${code}. Vence en 15 minutos. Si no lo pediste vos, ignorá este mail.`);
+  } catch (e) { console.warn('Mail', e.message); return res.status(502).json({ ok: false, error: 'send_failed' }); }
+  hist.push(Date.now()); mailRate.set(email, hist); mailDay.n++;
+  mailPending.set(userId, { code, email, tail, at: Date.now(), tries: 0 });
+  console.log('Mail: código enviado a …@' + email.split('@')[1]);
+  res.json({ ok: true, configured: true, sent: true });
+});
+app.post('/api/mail/check', (req, res) => {
+  const b = req.body || {}, userId = String(b.userId || '').slice(0, 60), code = String(b.code || '').replace(/\D/g, '');
+  const p = mailPending.get(userId);
+  if (!p || Date.now() - p.at > 15 * 60_000) return res.json({ ok: false, error: 'expired' });
+  if (++p.tries > 5) { mailPending.delete(userId); return res.json({ ok: false, error: 'too_many' }); }
+  if (code !== p.code) return res.json({ ok: false, error: 'wrong', left: 5 - p.tries });
+  mailPending.delete(userId);
+  const v = { tail: p.tail, email: p.email, at: Date.now(), via: 'mail' }; waVerified.set(userId, v); kvSet('wa', userId, v);
+  res.json({ ok: true, verified: true, email: p.email });
+});
+setInterval(() => { const now = Date.now(); for (const [u, v] of mailPending) if (now - v.at > 20 * 60_000) mailPending.delete(u); }, 5 * 60_000).unref();
+let waReady = WA_IS_TEST;
+app.get('/api/verify/methods', (_req, res) => { res.json({ ok: true, tg: Boolean(TG_TOKEN && tgUser), mail: GM_ON, wa: Boolean(WA_NUMBER && waReady) }); });
 
 
 /* ---------------- fotos de documentos (conductores y vehículos) ----------------
@@ -1321,7 +1447,8 @@ app.post('/api/account/find', async (req, res) => {
   let pax = null, drv = null;
   for (const room of rooms.values()) for (const m of room.sticky.values()) {
     const d = m && m.data; if (!d || typeof d !== 'object') continue;
-    if (tail8(d.phone) !== v.tail) continue;
+    if (v.via === 'mail' && v.email) { if (String(d.email || '').trim().toLowerCase() !== v.email) continue; }
+    else if (tail8(d.phone) !== v.tail) continue;
     const when = Number(d.upd || d.updatedAt || m.at || 0);
     if (m.type === 'pax-reg' && (!pax || when > pax._w)) pax = Object.assign({}, d, { _w: when });
     if (m.type === 'driver-reg' && !d.hiddenAt && (!drv || when > drv._w)) drv = Object.assign({}, d, { _w: when });
