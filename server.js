@@ -938,6 +938,11 @@ function founderCompute(r) {
   let n = Object.keys(ids).length;
   if (cfg.auto) for (const x of el) { if (n >= cfg.cap) break; if (x.id === first || ids[x.id] || removed[x.id]) continue; ids[x.id] = now; n++; }
   founderPublish(r, ids, removed, cfg, el.length, first);
+  try {   /* diagnóstico: una línea en el log cada vez que cambia algo */
+    const by = {}; for (const m of r.sticky.values()) if (m && m.type === 'driver-reg' && m.data) by[m.data.status || '?'] = (by[m.data.status || '?'] || 0) + 1;
+    const sg = JSON.stringify([by, el.length, Object.keys(ids).length, first]);
+    if (r._fLog !== sg) { r._fLog = sg; console.log('Fundadores [' + r.name + '] conductores por estado ' + JSON.stringify(by) + ' · elegibles ' + el.length + ' · fundadores ' + Object.keys(ids).length + ' · primero ' + (first || 'no'));  }
+  } catch (e) {}
 }
 setInterval(() => { for (const r of rooms.values()) { try { founderCompute(r); } catch (e) { console.warn('founder', e.message); } } }, 30_000).unref();
 app.post('/api/admin/founder-cfg', (req, res) => {
