@@ -111,7 +111,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-reset']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -207,7 +207,16 @@ function findDupReg(room, type, d) {
   }
   return null;
 }
+/* V497 · después de «Empezar de cero» no se aceptan registros viejos que un celular sin limpiar quiera volver a mandar */
+function resetAtOf(room) { const m = room.sticky.get('cfg-reset|cfg:reset'); return Number(m && m.data && m.data.at) || 0; }
+function staleReg(room, m) {
+  if (!m || !m.data || (m.type !== 'pax-reg' && m.type !== 'driver-reg')) return false;
+  const ra = resetAtOf(room); if (!ra) return false;
+  const born = Number(m.type === 'pax-reg' ? m.data.at : m.data.registeredAt) || 0;
+  return !!born && born < ra - 5 * 60_000;
+}
 function regBlocked(room, m) {
+  if (staleReg(room, m)) return true;
   if (!m || !m.data) return false;
   if (m.type === 'driver-reg' && m.data.status === 'pendiente') return !!findDupReg(room, 'driver-reg', m.data);
   if (m.type === 'pax-reg' && !room.sticky.has('pax-reg|' + (m.key || ''))) return !!findDupReg(room, 'pax-reg', m.data);
@@ -225,7 +234,7 @@ app.post('/api/bus/batch', (req, res) => {
   const r = getRoom(room);
   let last = r.seq;
   for (const m of messages.slice(0, 100)) {
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -242,7 +251,7 @@ app.post('/api/bus/batch', (req, res) => {
 
 app.post('/api/bus', (req, res) => {
   const { room, ...m } = req.body || {};
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -1179,7 +1188,37 @@ app.post('/api/admin/user-stats', (req, res) => {
 
 /* V495 · MODO MANTENIMIENTO · lo activa el administrador y lo ve cualquier dispositivo (se reparte por el bus y se consulta por GET) */
 function maintGet(roomName) { const m = getRoom(roomName).sticky.get('cfg-maint|cfg:maint'); const d = m && m.data; return d && d.on ? { on: true, msg: String(d.msg || ''), eta: String(d.eta || ''), at: Number(d.at) || 0 } : { on: false, msg: '', eta: '', at: Number(d && d.at) || 0 }; }
-app.get('/api/maint', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(Object.assign({ ok: true, serverTime: Date.now() }, maintGet(req.query.room))); });
+app.get('/api/maint', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(Object.assign({ ok: true, serverTime: Date.now(), reset: resetAtOf(getRoom(req.query.room)) }, maintGet(req.query.room))); });
+
+/* V497 · EMPEZAR DE CERO · borra registros de pasajeros y conductores, viajes, deudas, pagos, calificaciones, fundadores,
+   verificaciones, fotos e historial. La configuración (precios, deuda, cupo, fundadores, avisos, mantenimiento) queda igual.
+   Los celulares reciben la orden y borran sus datos guardados (como una instalación nueva). */
+const RESET_LIMIT = Date.UTC(2026, 9, 15, 15, 0, 0);   /* 15/10/2026 12:00 (Argentina): después de esta hora la limpieza única no corre nunca */
+let resetRan = false;   /* en esta ejecución del server corre como mucho UNA vez, pase lo que pase */
+async function resetOnce() {
+  if (resetRan) return; resetRan = true;
+  if (Date.now() > RESET_LIMIT) return;   /* V497 · pasada esta fecha el borrado NUNCA corre, haya lo que haya en la base */
+  if (dbState !== 'on' || !db) return;   /* sin base no hay dónde anotar que ya se hizo: no se toca nada */
+  try { const q = await db.query(`SELECT 1 FROM mobi_kv WHERE ns = 'sys' AND id = 'reset497'`); if (q.rows.length) return; } catch (e) { console.warn('Limpieza única · no se pudo revisar:', e.message); return; }
+  const at = Date.now();
+  /* 1° se anota que ya se hizo (si no se puede anotar, NO se borra nada) y recién después se borra: así nunca se repite */
+  try { await db.query(`INSERT INTO mobi_kv (ns, id, data, at) VALUES ('sys', 'reset497', $1::jsonb, now()) ON CONFLICT (ns, id) DO NOTHING`, [JSON.stringify({ at })]); const c = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'sys' AND id = 'reset497'`); if (!c.rows[0] || Number(c.rows[0].data && c.rows[0].data.at) !== at) return; }
+  catch (e) { console.warn('Limpieza única · no se pudo anotar, no se borra nada:', e.message); return; }
+  const keep = (t) => /^cfg-/.test(String(t || '')) && t !== 'cfg-reset'; let n = 0;
+  for (const r of rooms.values()) {
+    for (const [k, m] of [...r.sticky.entries()]) if (!m || !keep(m.type)) { r.sticky.delete(k); n++; }
+    r.ring = []; r.claims.clear(); r.parts.clear(); r.seen = new Map(); r._fSig = ''; r._cupoSig = '';
+  }
+  dirty.clear(); dirtySlow.clear();
+  waVerified.clear(); waPending.clear(); tgPending.clear(); tgChat.clear(); mailPending.clear(); mailRate.clear(); docMem.clear();
+  dHist.clear(); dSess.clear(); dDirty.clear(); pushSubs.clear(); pushQueue.clear(); pushSurge.clear(); gps.clear();
+  try {
+    await db.query(`DELETE FROM mobi_sticky WHERE msg->>'type' NOT LIKE 'cfg-%' OR msg->>'type' = 'cfg-reset'`);
+    await db.query(`DELETE FROM mobi_kv WHERE ns IN ('wa','doc','dhist','dsess','claim') OR (ns = 'push' AND id NOT IN ('vapid','last'))`);
+  } catch (e) { console.warn('Limpieza única · error borrando en la base (NO se reintenta):', e.message); }
+  for (const r of rooms.values()) pushMessage(r, { type: 'cfg-reset', key: 'cfg:reset', src: 'admin', data: { at } });
+  console.log('LIMPIEZA ÚNICA · empezó de cero · se borraron', n, 'registros · la configuración queda igual · no se repite');
+}
 app.post('/api/admin/maint', (req, res) => {
   const bd = req.body || {};
   if (!adminOk(bd.token) && !sbxOk(bd)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -1523,5 +1562,6 @@ setInterval(purgeUnverified, 6 * 3600_000).unref();
 
 await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
+setTimeout(() => { resetOnce().catch((e) => console.warn('Limpieza única', e.message)); }, 8000).unref();   /* V497 · una sola vez */
 /* al apagar, guardar lo pendiente */
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { try { for (let i = 0; i < 50 && flushing; i++) await new Promise((r) => setTimeout(r, 100)); for (const [k, v] of dirtySlow) dirty.set(k, v); await flushSticky(); } catch (e) {} process.exit(0); });
