@@ -37,7 +37,8 @@ app.use(cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGIN.includes('*') || ALLOWED_ORIGIN.includes(origin)) return cb(null, true);
     return cb(new Error('Origin not allowed by CORS'));
-  }
+  },
+  maxAge: 7200
 }));
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { if (req.url && req.url.startsWith('/api/wa/webhook')) req.rawBody = buf; } }));
@@ -98,6 +99,9 @@ async function dbInit() {
     try { const st = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'addrstat' AND id = 'all'`); if (st.rows[0]) Object.assign(addrStat, st.rows[0].data); } catch (e) { console.warn('addrstat', e.message); }
     try { const pv = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'push'`); for (const row of pv.rows) { if (row.id === 'vapid') pushVapidLoad(row.data); else if (row.id === 'last') { Object.assign(pushLast.periodic, row.data.periodic || {}); Object.assign(pushLast.demand, row.data.demand || {}); } else pushSubs.set(row.id, row.data); } } catch (e) { console.warn('push', e.message); } pushLoaded = true;
     try { const ad = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'addr'`); for (const row of ad.rows) addrMem.set(row.id, row.data); } catch (e) { console.warn('addr', e.message); }
+    try { const at = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'admtok'`); for (const row of at.rows) if (row.data && row.data.t && Number(row.data.exp) > Date.now()) adminTokens.set(String(row.data.t), Number(row.data.exp)); db.query(`DELETE FROM mobi_kv WHERE ns = 'admtok' AND at < now() - interval '13 hours'`).catch(() => {}); } catch (e) { console.warn('admtok', e.message); }
+    try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
+    try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) waVerified.set(row.id, row.data);
     try { const g = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'wacfg' AND id = 'regblock'`); if (g.rows[0]) waRegBlockUntil = Number(g.rows[0].data.until) || 0; } catch (e) {}
@@ -111,7 +115,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-reset']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-reset', 'drv-chg']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -222,6 +226,146 @@ function regBlocked(room, m) {
   if (m.type === 'pax-reg' && !room.sticky.has('pax-reg|' + (m.key || ''))) return !!findDupReg(room, 'pax-reg', m.data);
   return false;
 }
+
+/* =====================================================================
+   V500 · SEGURIDAD
+   - Cada celular tiene una llave propia (x-mobi-sk). La cuenta (pasajero o conductor) queda atada al celular que la creó;
+     otro celular no puede modificarla. Al recuperar la cuenta ("Ya tengo cuenta", con Telegram o mail) pasa al celular nuevo.
+   - Aprobar o rechazar conductores, confirmar pagos y retiros: SOLO el administrador (clave verificada en el servidor).
+   - Pagos con Mercado Pago: el servidor confirma que el cobro existió de verdad.
+   - Datos personales (DNI, fotos, celulares, alias, movimientos): solo el administrador y el dueño de la cuenta.
+   ===================================================================== */
+const ownMap = new Map();                 // 'sala|drv|id' o 'sala|pax|id' -> huella de la llave del celular
+const mpOrders = new Map();               // orderId -> { amount, ok, used, at }
+function skHash(v) { v = String(v || ''); return /^[a-f0-9]{32,64}$/.test(v) ? crypto.createHash('sha256').update('mobi-sk|' + v).digest('hex').slice(0, 40) : ''; }
+function authOf(req, room) {
+  const h = req.headers || {}, b = req.body || {};
+  const adm = String(h['x-mobi-adm'] || '');
+  const admin = !!adm && (adminOk(adm) || sbxOk({ token: adm, room }));
+  return { admin, tried: !!adm && !admin, sk: skHash(h['x-mobi-sk']) };
+}
+const OWN_RE = { drv: /^drv_[a-z0-9]{3,24}$/, pax: /^pax_[a-z0-9]{3,24}$/ };
+function ownKey(room, kind, id) { return (typeof room === 'string' ? room : room.name) + '|' + kind + '|' + id; }
+function ownGet(room, kind, id) { return ownMap.get(ownKey(room, kind, id)) || ''; }
+function ownSet(room, kind, id, sk) { if (!sk) return; const k = ownKey(room, kind, id); if (ownMap.get(k) === sk) return; ownMap.set(k, sk); kvSet('own', k, { h: sk, at: Date.now() }); }
+/* el dueño: si la cuenta todavía no tiene celular asignado, queda con el primero que la usa */
+function isOwner(room, kind, id, sk, bind) {
+  if (!sk || !OWN_RE[kind] || !OWN_RE[kind].test(String(id || ''))) return false;
+  const cur = ownGet(room, kind, id);
+  if (!cur) { if (bind) ownSet(room, kind, id, sk); return !!bind; }
+  return cur === sk;
+}
+function stickyData(room, k) { const m = room.sticky.get(k); return (m && m.data && typeof m.data === 'object') ? m.data : null; }
+function waOkFor(id, phone) { const v = waVerified.get(String(id || '')); return !!(v && v.tail && v.tail === tail8(phone)); }
+const ADMIN_ONLY_DRV = ['reviewedAt', 'approvedAt', 'approvedSig', 'reason', 'hiddenAt', 'deletedAt'];
+const LOCK_APPROVED_DRV = ['name', 'dni', 'plate', 'vehicle', 'docSig', 'docs', 'registeredAt', 'submittedAt', 'submittedSig'];
+/* revisa un mensaje que manda un celular. Devuelve el mensaje (a veces corregido) o null si no se acepta */
+function guardMsg(room, m, auth) {
+  if (!m || typeof m.type !== 'string') return m;
+  const t = m.type, d = m.data;
+  const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'drv-chg';
+  if (!SENS) return m;
+  if (!d || typeof d !== 'object') return null;
+  if (auth.admin) return m;
+  if (auth.tried) return null;   /* clave de administrador vencida: no se toma como un celular común (no se apropia de cuentas) */
+  if (t === 'driver-reg') {
+    const id = String(d.id || ''); if (!OWN_RE.drv.test(id)) return null;
+    m.key = 'dr:' + id;
+    const prev = stickyData(room, 'driver-reg|dr:' + id);
+    if (!isOwner(room, 'drv', id, auth.sk, !prev || !ownGet(room, 'drv', id))) return null;
+    const o = Object.assign({}, d), ps = String((prev && prev.status) || 'borrador');
+    if (!(o.status === 'borrador' || o.status === 'pendiente' || o.status === ps)) o.status = ps;     /* aprobar o rechazar: solo el administrador */
+    if (prev) {
+      ADMIN_ONLY_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
+      if (o.status === 'pendiente' && ps !== 'pendiente' && Number(d.submittedAt || 0) > Number(prev.hiddenAt || 0)) o.hiddenAt = prev.hiddenAt;   /* reenvío: vuelve a aparecer (el admin lo ve) */
+      if (String(prev.phone || '').trim()) o.phone = prev.phone;                                          /* el celular no se cambia nunca */
+      if (ps === 'aprobado' && o.status === 'aprobado') {
+        LOCK_APPROVED_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
+        const pc = Array.isArray(prev.cars) ? prev.cars : [];
+        if (Array.isArray(o.cars)) o.cars = o.cars.slice(0, 6).map((c) => { const old = pc.find((x) => x && c && String(x.plate || '') === String(c.plate || '')); return Object.assign({}, c, { status: old ? old.status : 'pendiente' }); });
+      }
+    } else { ADMIN_ONLY_DRV.forEach((k) => delete o[k]); }
+    o.wa = waOkFor(id, o.phone);
+    m.data = o; return m;
+  }
+  if (t === 'pax-reg') {
+    const id = String(d.id || ''); if (!OWN_RE.pax.test(id)) return null;
+    m.key = 'pr:' + id;
+    const prev = stickyData(room, 'pax-reg|pr:' + id);
+    if (!isOwner(room, 'pax', id, auth.sk, !prev || !ownGet(room, 'pax', id))) return null;
+    const o = Object.assign({}, d);
+    if (prev) {
+      ['name', 'dni', 'dniImg', 'at'].forEach((k) => { if (prev[k] !== undefined && String(prev[k] || '') !== '') o[k] = prev[k]; });   /* nombre y DNI: solo con revisión */
+      if (String(prev.phone || '').trim()) o.phone = prev.phone;
+      if (String(prev.photo || '')) o.photo = prev.photo;                                                  /* la foto de perfil, una vez cargada, no se cambia */
+      ['deletedAt'].forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
+    }
+    o.wa = waOkFor(id, o.phone);
+    m.data = o; return m;
+  }
+  if (t === 'pax-chg') {
+    if (!(d.status === 'pendiente' || d.status === 'cancelado')) return null;
+    if (!isOwner(room, 'pax', String(d.id || ''), auth.sk, false)) return null;
+    m.key = 'pc:' + d.id; return m;
+  }
+  if (t === 'drv-chg') {
+    if (!(d.status === 'pendiente' || d.status === 'cancelado')) return null;
+    if (!isOwner(room, 'drv', String(d.id || ''), auth.sk, false)) return null;
+    m.key = 'xc:' + d.id; return m;
+  }
+  /* movimientos de la cuenta del conductor: solo los suyos, nuevos (no se pisan), y lo que confirma el admin no lo puede confirmar él */
+  const drv = String(d.driver || '');
+  if (!isOwner(room, 'drv', drv, auth.sk, false)) return null;
+  const id = String(d.id || ''); if (!/^[a-z0-9_-]{2,60}$/i.test(id)) return null;
+  if (t === 'debt-charge') {
+    m.key = 'dc:' + id;
+    if (room.sticky.has('debt-charge|dc:' + id)) return null;
+    const amt = Number(d.amount); if (!(amt > 0 && amt <= MP_MAX)) return null;
+    if (d.type === 'charge') return m;
+    if (d.type !== 'credit') return null;
+    /* saldo a favor: tiene que venir de un viaje real que hizo este conductor */
+    const k = String(d.tripKey || ''); if (!k) return null;
+    const tr = stickyData(room, 'trip|tr:' + k + ':drv'), cl = room.claims.get(k);
+    const who = String((tr && tr.active && tr.active.driver && tr.active.driver.id) || (cl && cl.driverId) || '');
+    if (who !== drv) return null;
+    let n = 0; for (const x of room.sticky.values()) if (x && x.type === 'debt-charge' && x.data && x.data.type === 'credit' && String(x.data.tripKey || '') === k) n++;
+    if (n >= 3) return null;
+    return m;
+  }
+  if (t === 'debt-pay') {
+    m.key = 'dp:' + id;
+    if (room.sticky.has('debt-pay|dp:' + id)) return null;
+    const amt = Number(d.amount); if (!(amt > 0 && amt <= MP_MAX)) return null;
+    const o = Object.assign({}, d);
+    if (o.type === 'payout') { o.status = 'pendiente'; m.data = o; return m; }
+    if (o.type !== 'payment') return null;
+    if (o.status === 'confirmado') {
+      const mo = mpOrders.get(String(o.mpOrderId || ''));
+      if (mo && mo.ok && !mo.used && Math.abs(Number(mo.amount) - amt) < 0.01) { mo.used = drv; kvSet('mpord', String(o.mpOrderId), mo); }
+      else { o.status = 'pendiente'; o.note = 'Sin confirmación de Mercado Pago: revisar'; }
+    } else o.status = 'pendiente';
+    if (o.status !== 'confirmado') delete o.confirmedAt;
+    m.data = o; return m;
+  }
+  return m;
+}
+/* qué ve cada celular de los datos de otros */
+const DRV_PUBLIC = ['id', 'name', 'status', 'plate', 'vehicle', 'registeredAt', 'submittedAt', 'reviewedAt', 'approvedAt', 'updatedAt', 'hiddenAt', 'deletedAt', 'wa', 'docs'];
+function viewFor(room, x, auth) {
+  if (auth.admin) return x;
+  const t = x.type, d = x.data;
+  if (!d || typeof d !== 'object') return x;
+  if (t === 'pax-reg') return ownGet(room, 'pax', String(d.id || '')) === auth.sk && auth.sk ? x : null;
+  if (t === 'pax-chg') return ownGet(room, 'pax', String(d.id || '')) === auth.sk && auth.sk ? x : null;
+  if (t === 'driver-reg') {
+    if (auth.sk && ownGet(room, 'drv', String(d.id || '')) === auth.sk) return x;
+    const o = {}; DRV_PUBLIC.forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; });
+    if (Array.isArray(d.cars)) o.cars = d.cars.map((c) => c && ({ model: c.model, plate: c.plate, color: c.color, status: c.status }));
+    return Object.assign({}, x, { data: o });
+  }
+  if (t === 'drv-chg' || t === 'debt-charge' || t === 'debt-pay') return auth.sk && ownGet(room, 'drv', String(d.id && t === 'drv-chg' ? d.id : d.driver || '')) === auth.sk ? x : null;
+  return x;
+}
 app.post('/api/reg/check', (req, res) => {
   const b = req.body || {}, role = b.role === 'drv' ? 'driver-reg' : 'pax-reg';
   const o = findDupReg(getRoom(b.room), role, { id: String(b.id || ''), phone: b.phone, dni: b.dni });
@@ -231,9 +375,10 @@ app.post('/api/reg/check', (req, res) => {
 app.post('/api/bus/batch', (req, res) => {
   const { room, messages } = req.body || {};
   if (!Array.isArray(messages)) return res.status(400).json({ ok: false, error: 'messages must be an array' });
-  const r = getRoom(room);
+  const r = getRoom(room), auth = authOf(req, r.name);
   let last = r.seq;
-  for (const m of messages.slice(0, 100)) {
+  for (const m0 of messages.slice(0, 100)) {
+    const m = guardMsg(r, m0, auth); if (!m) continue;   /* V500 · seguridad */
     if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
@@ -250,7 +395,9 @@ app.post('/api/bus/batch', (req, res) => {
 });
 
 app.post('/api/bus', (req, res) => {
-  const { room, ...m } = req.body || {};
+  const { room, ...m0 } = req.body || {};
+  const m = guardMsg(getRoom(room), m0, authOf(req, getRoom(room).name));   /* V500 · seguridad */
+  if (!m) return res.status(403).json({ ok: false, error: 'forbidden' });
   if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
@@ -281,7 +428,8 @@ app.get('/api/bus', (req, res) => {
     } else messages = r.ring.filter(x => x.id > after);
   }
   /* V448 · cada celular recibe lo suyo: los demás conductores solo se enteran de que el viaje ya fue tomado (aviso corto) */
-  const all = String(req.query.all || '') === '1';
+  const auth = authOf(req, r.name);
+  const all = String(req.query.all || '') === '1' && auth.admin;   /* V500 · «todo» solo para el administrador */
   /* V450 · zona: si el celular dice dónde está, solo recibe pedidos y conductores a menos de GEO_KM (el retiro máximo es 4 km; el resto es margen) */
   const GEO_KM = 6.5;
   const geo = all ? [] : String(req.query.geo || '').split(';').slice(0, 3).map(t => t.split(',').map(Number)).filter(v => v.length === 2 && v.every(Number.isFinite));
@@ -296,8 +444,9 @@ app.get('/api/bus', (req, res) => {
   /* V469 · el pasajero no necesita la ruta de los pedidos ajenos: solo dónde y cuándo (para la demanda) */
   const lite = String(req.query.lite || '') === '1' && !all;
   const out = [];
-  for (const x of messages) {
-    if (me && x.src === me) continue;
+  for (const x0 of messages) {
+    if (me && x0.src === me) continue;
+    const x = viewFor(r, x0, auth); if (!x) continue;   /* V500 · datos personales solo para el dueño y el administrador */
     if (!inZone(x)) continue;
     if (lite && x.type === 'trip' && !x.priv && x.data && x.data.active) {
       const a = x.data.active, set = r.parts.get(String(a.tripKey || ''));
@@ -327,6 +476,8 @@ app.post('/api/trip/claim', (req, res) => {
   const te = r.sticky.get('trip-end|te:' + k), tp = r.sticky.get('trip|tr:' + k + ':pax');
   if (te || (tp && tp.data && tp.data.active && /Cancel/i.test(String(tp.data.active.status || '')))) return res.json({ ok: false, error: 'ended' });
   if (cupoWaiting(r, d)) return res.json({ ok: false, error: 'cupo' });   /* V473 · en lista de espera */
+  { const au = authOf(req, r.name), dr = stickyData(r, 'driver-reg|dr:' + d);   /* V500 · solo un conductor APROBADO por el administrador, desde su propio celular, puede tomar viajes */
+    if (!au.admin && (!isOwner(r, 'drv', d, au.sk, false) || !dr || dr.status !== 'aprobado' || drvHidden(dr) || dr.deletedAt)) return res.json({ ok: false, error: 'not_approved' }); }
   const cur = r.claims.get(k);
   if (cur && cur.driverId !== d) return res.json({ ok: false, winner: cur.driverId });
   r.claims.set(k, { driverId: d, at: Date.now() });
@@ -471,6 +622,7 @@ app.post('/api/mercadopago/pay', async (req, res) => {
     const bad = ['failed', 'rejected', 'canceled', 'cancelled', 'expired'];
     const authorized = !bad.includes(String(r.data.status)) && !bad.includes(String(pay.status));
     if (!authorized) console.log('MP pago no autorizado', r.data.status, r.data.status_detail || pay.status_detail, JSON.stringify(pay).slice(0, 500));
+    if (r.data.id) { const mo = { amount, ok: authorized && captureMode === 'automatic', used: '', at: Date.now() }; mpOrders.set(String(r.data.id), mo); kvSet('mpord', String(r.data.id), mo); }   /* V500 · el servidor recuerda los cobros reales */
     res.status(201).json({
       ok: true, authorized, captureMode, reason: authorized ? undefined : mpReason({ a: r.data.status_detail, b: pay.status_detail, c: pay }), orderId: r.data.id, paymentId: pay.id || null,
       status: r.data.status, statusDetail: r.data.status_detail || pay.status_detail || null,
@@ -486,6 +638,7 @@ app.post('/api/mercadopago/capture/:orderId', async (req, res) => {
   try {
     const id = encodeURIComponent(req.params.orderId);
     const r = await mpCall('POST', `/v1/orders/${id}/capture`, null, `cap_${id}`);
+    if (r.ok) { const k = String(req.params.orderId), mo = mpOrders.get(k); if (mo) { mo.ok = true; kvSet('mpord', k, mo); } }
     res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.data.status, statusDetail: r.data.status_detail, details: r.ok ? undefined : r.data });
   } catch (error) { res.status(502).json({ ok: false, error: error.message }); }
 });
@@ -552,6 +705,7 @@ app.post('/api/admin/login', (req, res) => {
   adminFails.delete(ip);
   const token = crypto.randomBytes(24).toString('hex');
   adminTokens.set(token, now + 12 * 3600_000);
+  kvSet('admtok', crypto.createHash('sha256').update(token).digest('hex'), { exp: now + 12 * 3600_000, t: token });   /* V500 · la sesión del administrador sobrevive a un reinicio del servidor */
   res.json({ ok: true, token, expiresInSec: 12 * 3600 });
 });
 app.post('/api/admin/check', (req, res) => {
@@ -921,6 +1075,8 @@ const okOwner = (o) => /^(drv_[a-z0-9]{3,20}|car:drv_[a-z0-9]{3,20}:[A-Z0-9]{5,8
 app.post('/api/docs/put', async (req, res) => {
   const b = req.body || {}, owner = String(b.owner || ''), kind = String(b.kind || ''), img = String(b.img || '');
   if (!okOwner(owner) || !DOC_KINDS.has(kind)) return res.status(400).json({ ok: false, error: 'bad_owner_or_kind' });
+  { const au = authOf(req, String(b.room || 'pilot')), oid = owner.replace(/^car:/, '').split(':')[0], kd = /^drv_/.test(oid) ? 'drv' : '';   /* V500 · las fotos de una cuenta solo las sube su dueño */
+    if (kd && !adminOk(String((req.headers || {})['x-mobi-adm'] || ''))) { const rm = getRoom(/^sandbox/.test(String(b.room || '')) ? 'pilot' : b.room); if (!isOwner(rm, kd, oid, au.sk, !ownGet(rm, kd, oid))) return res.status(403).json({ ok: false, error: 'forbidden' }); } }   /* las fotos se guardan para todas las salas: el sandbox no sirve para pisarlas */
   if (!/^data:image\/(jpeg|png|webp);base64,/.test(img) || img.length > 1_600_000) return res.status(400).json({ ok: false, error: 'bad_image' });
   const id = owner + '|' + kind, item = { img, at: Date.now() };
   docMem.set(id, item); if (docMem.size > 400) docMem.delete(docMem.keys().next().value);
@@ -946,8 +1102,38 @@ app.post('/api/admin/paxchg', (req, res) => {
   const id = String(b.id || ''), status = b.status === 'aprobado' ? 'aprobado' : b.status === 'rechazado' ? 'rechazado' : '';
   if (!/^pax_[a-z0-9]{3,20}$/.test(id) || !status) return res.status(400).json({ ok: false, error: 'datos' });
   const data = { id, rid: String(b.rid || '').slice(0, 40), status, reason: String(b.reason || '').slice(0, 200), at: Date.now() };
-  const saved = pushMessage(getRoom(b.room), { type: 'pax-chg', key: 'pc:' + id, src: 'admin', data });
+  const rm = getRoom(b.room), pend = stickyData(rm, 'pax-chg|pc:' + id), cur = stickyData(rm, 'pax-reg|pr:' + id);
+  if (status === 'aprobado' && pend && cur && pend.status === 'pendiente') {   /* V500 · el servidor aplica el cambio aprobado (el celular ya no puede cambiar nombre ni DNI solo) */
+    const n = Object.assign({}, cur);
+    ['name', 'dni', 'email', 'emName', 'emPhone', 'dniImg', 'photo'].forEach((k) => { if (pend[k] !== undefined && pend[k] !== null && String(pend[k]) !== '') n[k] = pend[k]; });
+    n.upd = Date.now(); pushMessage(rm, { type: 'pax-reg', key: 'pr:' + id, src: 'admin', data: n });
+  }
+  const saved = pushMessage(rm, { type: 'pax-chg', key: 'pc:' + id, src: 'admin', data });
   res.json({ ok: true, data, id: saved && saved.id });
+});
+
+/* V500 · cambios de datos de un conductor aprobado (nombre, DNI, vehículo, fotos): los pide el conductor y los aprueba el administrador */
+app.post('/api/admin/drvchg', async (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const id = String(b.id || ''), status = b.status === 'aprobado' ? 'aprobado' : b.status === 'rechazado' ? 'rechazado' : '';
+  if (!OWN_RE.drv.test(id) || !status) return res.status(400).json({ ok: false, error: 'datos' });
+  const rm = getRoom(b.room), pend = stickyData(rm, 'drv-chg|xc:' + id), cur = stickyData(rm, 'driver-reg|dr:' + id);
+  if (!pend || pend.status !== 'pendiente') return res.status(409).json({ ok: false, error: 'sin_pedido' });
+  if (status === 'aprobado' && cur) {
+    const n = Object.assign({}, cur);
+    ['name', 'dni', 'plate', 'vehicle'].forEach((k) => { if (pend[k] !== undefined && String(pend[k] || '').trim()) n[k] = String(pend[k]).trim(); });
+    const imgs = pend.imgs && typeof pend.imgs === 'object' ? pend.imgs : {};
+    if (adminOk(b.token)) for (const kind of Object.keys(imgs)) { const img = String(imgs[kind] || ''); if (!['cedula', 'license', 'dniF', 'dniB', 'profile'].includes(kind) || !/^data:image\/(jpeg|png|webp);base64,/.test(img)) continue;
+      const item = { img, at: Date.now() }; docMem.set(id + '|' + kind, item); await kvSet('doc', id + '|' + kind, item); n.docs = Object.assign({}, n.docs, { [kind]: true }); }
+    n.updatedAt = Date.now(); n.chgAt = Date.now();
+    pushMessage(rm, { type: 'driver-reg', key: 'dr:' + id, src: 'admin', data: n });
+  }
+  const data = { id, rid: String(pend.rid || '').slice(0, 40), status, reason: String(b.reason || '').slice(0, 200), at: Date.now() };
+  if (status === 'aprobado') Object.assign(data, { name: pend.name, dni: pend.dni, plate: pend.plate, vehicle: pend.vehicle, imgs: pend.imgs });   /* el celular del conductor guarda lo aprobado */
+  const saved = pushMessage(rm, { type: 'drv-chg', key: 'xc:' + id, src: 'admin', data });
+  console.log('Cambio de datos de conductor', id, status);
+  res.json({ ok: true, data: { id, status }, id: saved && saved.id });
 });
 
 /* V398 · tarifas, comisión y plus por retiro lejano · solo administrador (se reparte a todos por el bus) */
@@ -1193,32 +1379,6 @@ app.get('/api/maint', (req, res) => { res.setHeader('Cache-Control', 'no-store')
 /* V497 · EMPEZAR DE CERO · borra registros de pasajeros y conductores, viajes, deudas, pagos, calificaciones, fundadores,
    verificaciones, fotos e historial. La configuración (precios, deuda, cupo, fundadores, avisos, mantenimiento) queda igual.
    Los celulares reciben la orden y borran sus datos guardados (como una instalación nueva). */
-const RESET_LIMIT = Date.UTC(2026, 9, 15, 15, 0, 0);   /* 15/10/2026 12:00 (Argentina): después de esta hora la limpieza única no corre nunca */
-let resetRan = false;   /* en esta ejecución del server corre como mucho UNA vez, pase lo que pase */
-async function resetOnce() {
-  if (resetRan) return; resetRan = true;
-  if (Date.now() > RESET_LIMIT) return;   /* V497 · pasada esta fecha el borrado NUNCA corre, haya lo que haya en la base */
-  if (dbState !== 'on' || !db) return;   /* sin base no hay dónde anotar que ya se hizo: no se toca nada */
-  try { const q = await db.query(`SELECT 1 FROM mobi_kv WHERE ns = 'sys' AND id = 'reset497'`); if (q.rows.length) return; } catch (e) { console.warn('Limpieza única · no se pudo revisar:', e.message); return; }
-  const at = Date.now();
-  /* 1° se anota que ya se hizo (si no se puede anotar, NO se borra nada) y recién después se borra: así nunca se repite */
-  try { await db.query(`INSERT INTO mobi_kv (ns, id, data, at) VALUES ('sys', 'reset497', $1::jsonb, now()) ON CONFLICT (ns, id) DO NOTHING`, [JSON.stringify({ at })]); const c = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'sys' AND id = 'reset497'`); if (!c.rows[0] || Number(c.rows[0].data && c.rows[0].data.at) !== at) return; }
-  catch (e) { console.warn('Limpieza única · no se pudo anotar, no se borra nada:', e.message); return; }
-  const keep = (t) => /^cfg-/.test(String(t || '')) && t !== 'cfg-reset'; let n = 0;
-  for (const r of rooms.values()) {
-    for (const [k, m] of [...r.sticky.entries()]) if (!m || !keep(m.type)) { r.sticky.delete(k); n++; }
-    r.ring = []; r.claims.clear(); r.parts.clear(); r.seen = new Map(); r._fSig = ''; r._cupoSig = '';
-  }
-  dirty.clear(); dirtySlow.clear();
-  waVerified.clear(); waPending.clear(); tgPending.clear(); tgChat.clear(); mailPending.clear(); mailRate.clear(); docMem.clear();
-  dHist.clear(); dSess.clear(); dDirty.clear(); pushSubs.clear(); pushQueue.clear(); pushSurge.clear(); gps.clear();
-  try {
-    await db.query(`DELETE FROM mobi_sticky WHERE msg->>'type' NOT LIKE 'cfg-%' OR msg->>'type' = 'cfg-reset'`);
-    await db.query(`DELETE FROM mobi_kv WHERE ns IN ('wa','doc','dhist','dsess','claim') OR (ns = 'push' AND id NOT IN ('vapid','last'))`);
-  } catch (e) { console.warn('Limpieza única · error borrando en la base (NO se reintenta):', e.message); }
-  for (const r of rooms.values()) pushMessage(r, { type: 'cfg-reset', key: 'cfg:reset', src: 'admin', data: { at } });
-  console.log('LIMPIEZA ÚNICA · empezó de cero · se borraron', n, 'registros · la configuración queda igual · no se repite');
-}
 app.post('/api/admin/maint', (req, res) => {
   const bd = req.body || {};
   if (!adminOk(bd.token) && !sbxOk(bd)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -1534,6 +1694,8 @@ app.post('/api/account/find', async (req, res) => {
   }
   let drvDocs = null;
   if (drv && drv.id) drvDocs = await docsOf(drv.id);
+  { const sk = authOf(req, 'pilot').sk;   /* V500 · verificado por Telegram o mail: la cuenta pasa a este celular */
+    if (sk) for (const room of rooms.values()) { if (pax && pax.id && room.sticky.has('pax-reg|pr:' + pax.id)) ownSet(room, 'pax', String(pax.id), sk); if (drv && drv.id && room.sticky.has('driver-reg|dr:' + drv.id)) ownSet(room, 'drv', String(drv.id), sk); } }
   if (pax) delete pax._w; if (drv) { delete drv._w; delete drv._r; }
   console.log('Recuperar cuenta · …' + v.tail.slice(-4), 'vía ' + (v.via || '?'), pax ? 'pasajero' : '', drv ? 'conductor(' + String(drv.status || 'borrador') + ')' : '');
   res.json({ ok: true, pax, drv, drvDocs });
@@ -1562,6 +1724,5 @@ setInterval(purgeUnverified, 6 * 3600_000).unref();
 
 await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
-setTimeout(() => { resetOnce().catch((e) => console.warn('Limpieza única', e.message)); }, 8000).unref();   /* V497 · una sola vez */
 /* al apagar, guardar lo pendiente */
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { try { for (let i = 0; i < 50 && flushing; i++) await new Promise((r) => setTimeout(r, 100)); for (const [k, v] of dirtySlow) dirty.set(k, v); await flushSticky(); } catch (e) {} process.exit(0); });
