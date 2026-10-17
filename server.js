@@ -255,6 +255,8 @@ function isOwner(room, kind, id, sk, bind) {
   if (!cur) { if (bind) ownSet(room, kind, id, sk); return !!bind; }
   return cur === sk;
 }
+/* cuentas creadas antes de la V500 (todavía sin celular asignado): quedan con el primer celular que las usa */
+function legacyBind(room, kind, id) { return !ownGet(room, kind, id) && !!stickyData(room, (kind === 'pax' ? 'pax-reg|pr:' : 'driver-reg|dr:') + id); }
 function stickyData(room, k) { const m = room.sticky.get(k); return (m && m.data && typeof m.data === 'object') ? m.data : null; }
 function waOkFor(id, phone) { const v = waVerified.get(String(id || '')); return !!(v && v.tail && v.tail === tail8(phone)); }
 const ADMIN_ONLY_DRV = ['reviewedAt', 'approvedAt', 'approvedSig', 'reason', 'hiddenAt', 'deletedAt'];
@@ -305,17 +307,17 @@ function guardMsg(room, m, auth) {
   }
   if (t === 'pax-chg') {
     if (!(d.status === 'pendiente' || d.status === 'cancelado')) return null;
-    if (!isOwner(room, 'pax', String(d.id || ''), auth.sk, false)) return null;
+    if (!isOwner(room, 'pax', String(d.id || ''), auth.sk, legacyBind(room, 'pax', String(d.id || '')))) return null;
     m.key = 'pc:' + d.id; return m;
   }
   if (t === 'drv-chg') {
     if (!(d.status === 'pendiente' || d.status === 'cancelado')) return null;
-    if (!isOwner(room, 'drv', String(d.id || ''), auth.sk, false)) return null;
+    if (!isOwner(room, 'drv', String(d.id || ''), auth.sk, legacyBind(room, 'drv', String(d.id || '')))) return null;
     m.key = 'xc:' + d.id; return m;
   }
   /* movimientos de la cuenta del conductor: solo los suyos, nuevos (no se pisan), y lo que confirma el admin no lo puede confirmar él */
   const drv = String(d.driver || '');
-  if (!isOwner(room, 'drv', drv, auth.sk, false)) return null;
+  if (!isOwner(room, 'drv', drv, auth.sk, legacyBind(room, 'drv', drv))) return null;
   const id = String(d.id || ''); if (!/^[a-z0-9_-]{2,60}$/i.test(id)) return null;
   if (t === 'debt-charge') {
     m.key = 'dc:' + id;
@@ -477,7 +479,7 @@ app.post('/api/trip/claim', (req, res) => {
   if (te || (tp && tp.data && tp.data.active && /Cancel/i.test(String(tp.data.active.status || '')))) return res.json({ ok: false, error: 'ended' });
   if (cupoWaiting(r, d)) return res.json({ ok: false, error: 'cupo' });   /* V473 · en lista de espera */
   { const au = authOf(req, r.name), dr = stickyData(r, 'driver-reg|dr:' + d);   /* V500 · solo un conductor APROBADO por el administrador, desde su propio celular, puede tomar viajes */
-    if (!au.admin && (!isOwner(r, 'drv', d, au.sk, false) || !dr || dr.status !== 'aprobado' || drvHidden(dr) || dr.deletedAt)) return res.json({ ok: false, error: 'not_approved' }); }
+    if (!au.admin && (!isOwner(r, 'drv', d, au.sk, legacyBind(r, 'drv', d)) || !dr || dr.status !== 'aprobado' || drvHidden(dr) || dr.deletedAt)) return res.json({ ok: false, error: 'not_approved' }); }
   const cur = r.claims.get(k);
   if (cur && cur.driverId !== d) return res.json({ ok: false, winner: cur.driverId });
   r.claims.set(k, { driverId: d, at: Date.now() });
