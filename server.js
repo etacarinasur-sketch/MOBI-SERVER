@@ -99,6 +99,7 @@ async function dbInit() {
     try { const st = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'addrstat' AND id = 'all'`); if (st.rows[0]) Object.assign(addrStat, st.rows[0].data); } catch (e) { console.warn('addrstat', e.message); }
     try { const pv = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'push'`); for (const row of pv.rows) { if (row.id === 'vapid') pushVapidLoad(row.data); else if (row.id === 'last') { Object.assign(pushLast.periodic, row.data.periodic || {}); Object.assign(pushLast.demand, row.data.demand || {}); } else pushSubs.set(row.id, row.data); } } catch (e) { console.warn('push', e.message); } pushLoaded = true;
     try { const ad = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'addr'`); for (const row of ad.rows) addrMem.set(row.id, row.data); } catch (e) { console.warn('addr', e.message); }
+    try { const dl = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'dl' AND id = 'counts'`); if (dl.rows[0] && dl.rows[0].data) for (const k of DL_KINDS) { const o = dl.rows[0].data[k]; if (o) { dlStat[k].t = Number(o.t) || 0; dlStat[k].d = o.d || {}; } } } catch (e) { console.warn('dl', e.message); }
     try { const at = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'admtok'`); for (const row of at.rows) if (row.data && row.data.t && Number(row.data.exp) > Date.now()) adminTokens.set(String(row.data.t), Number(row.data.exp)); db.query(`DELETE FROM mobi_kv WHERE ns = 'admtok' AND at < now() - interval '13 hours'`).catch(() => {}); } catch (e) { console.warn('admtok', e.message); }
     try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
@@ -1098,6 +1099,37 @@ function sbxOk(b) { return String(b && b.token) === 'sbx' && /^sandbox/.test(Str
 function adminOk(t) { const exp = adminTokens.get(String(t || '')); return !!(exp && exp > Date.now()); }
 
 /* V352 · aprobar / rechazar cambios de datos de un pasajero · solo administrador */
+/* V503 · contador de descargas: la landing avisa con una imagen invisible (GET), sin datos personales */
+app.get('/api/dl', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const k = String(req.query.k || '');
+    if (DL_KINDS.includes(k)) {
+      const ip = String((req.headers['x-forwarded-for'] || req.ip || '')).split(',')[0].trim();
+      const who = crypto.createHash('sha256').update(ip + '|' + String(req.headers['user-agent'] || '')).digest('hex').slice(0, 24) + k;
+      const now = Date.now(), last = dlSeen.get(who) || 0;
+      if (now - last > 20 * 60_000) {
+        dlSeen.set(who, now);
+        if (dlSeen.size > 20000) for (const [h, t] of dlSeen) if (now - t > 20 * 60_000) dlSeen.delete(h);
+        const o = dlStat[k], day = dlDay(now); o.t++; o.d[day] = (o.d[day] || 0) + 1;
+        const keys = Object.keys(o.d).sort(); while (keys.length > 120) delete o.d[keys.shift()];
+        dlSave();
+      }
+    }
+  } catch (e) {}
+  res.status(204).end();
+});
+app.post('/api/admin/downloads', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const out = {};
+  for (const k of DL_KINDS) {
+    const o = dlStat[k], days = [];
+    for (let i = 13; i >= 0; i--) { const d = dlDay(Date.now() - i * 86400_000); days.push({ d, n: o.d[d] || 0 }); }
+    out[k] = { total: o.t, today: days[13].n, d7: days.slice(7).reduce((a, x) => a + x.n, 0), days };
+  }
+  res.setHeader('Cache-Control', 'no-store'); res.json({ ok: true, counts: out, serverTime: Date.now() });
+});
 app.post('/api/admin/paxchg', (req, res) => {
   const b = req.body || {};
   if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -1450,6 +1482,15 @@ app.post('/api/addr/verify', (req, res) => {
 
 /* V474 · acierto de cada fuente de direcciones: cuánto se equivocó el punto que mostró la lista frente a lo que confirmó la gente */
 const addrStat = {};      // fuente -> { n, ok, sum, big }
+
+/* V503 · contador de descargas de la landing: { apk:{t:total, d:{'2026-10-18':n}}, web:{...} } */
+const DL_KINDS = ['apk', 'web'];
+const dlStat = { apk: { t: 0, d: {} }, web: { t: 0, d: {} } };
+const dlSeen = new Map();   /* hash(ip)+tipo → última vez (solo en memoria): un mismo celular no suma más de una vez cada 20 min */
+let dlTimer = null;
+function dlDay(ts) { return new Date((ts || Date.now()) - 3 * 3600_000).toISOString().slice(0, 10); }
+function dlSave() { if (dlTimer) return; dlTimer = setTimeout(() => { dlTimer = null; kvSet('dl', 'counts', dlStat); }, 3000); dlTimer.unref && dlTimer.unref(); }
+
 let addrStatDirty = false;
 const statRate = new Map();
 app.post('/api/addr/stat', (req, res) => {
