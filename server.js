@@ -678,8 +678,8 @@ const needMp = (res) => {
   return true;
 };
 const cleanRef = (v) => String(v || `mobi_${Date.now()}`).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
-async function mpCall(method, url, body, idem) {
-  const r = await fetch(MP_API + url, { method, headers: mpHeaders(idem), body: body ? JSON.stringify(body) : undefined });
+async function mpCall(method, url, body, idem, extraH) {
+  const r = await fetch(MP_API + url, { method, headers: Object.assign(mpHeaders(idem), extraH || {}), body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, status: r.status, data };
 }
@@ -735,8 +735,16 @@ app.post('/api/mercadopago/pay', async (req, res) => {
     total_amount: amountStr, external_reference: reference, description: 'Viaje MOBI', payer,
     transactions: { payments: [{ amount: amountStr, payment_method: { id: String(methodId), type, token: String(token), installments: Number(b.installments) || 1 } }] }
   };
+  /* V517 · más datos para el antifraude de Mercado Pago (rechazos «riesgo alto»): huella del celular, nombre del pagador y detalle del ítem.
+     Si Mercado Pago no acepta algún dato extra, se reintenta con el pedido de siempre. */
+  const dev = /^[A-Za-z0-9:_.-]{8,200}$/.test(String(b.deviceId || '')) ? String(b.deviceId) : '';
+  const rich = JSON.parse(JSON.stringify(payload));
+  const nm = String(b.payerName || '').replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ' .-]/g, '').trim().split(/\s+/).filter(Boolean);
+  if (!b.customerId && nm.length >= 2) { rich.payer.first_name = nm.slice(0, -1).join(' ').slice(0, 60); rich.payer.last_name = nm[nm.length - 1].slice(0, 60); }
+  rich.items = [{ title: 'Viaje MOBI', quantity: 1, unit_price: amountStr }];
   try {
-    const r = await mpCall('POST', '/v1/orders', payload, `pay_${reference}`);
+    let r = await mpCall('POST', '/v1/orders', rich, `pay_${reference}`, dev ? { 'X-meli-session-id': dev } : null);
+    if (!r.ok && r.status === 400 && !/cc_rejected|high_risk|insufficient/.test(JSON.stringify(r.data || {}))) { console.log('MP: datos extra no aceptados, reintento simple', JSON.stringify(r.data).slice(0, 300)); r = await mpCall('POST', '/v1/orders', payload, `pay2_${reference}`, dev ? { 'X-meli-session-id': dev } : null); }
     if (!r.ok) { console.log('MP pago RECHAZADO', r.status, JSON.stringify(r.data).slice(0, 800)); return res.status(r.status).json({ ok: false, error: 'Mercado Pago rechazó el cobro', reason: mpReason(r.data), details: r.data }); }
     const pay = (r.data.transactions && r.data.transactions.payments && r.data.transactions.payments[0]) || {};
     const bad = ['failed', 'rejected', 'canceled', 'cancelled', 'expired'];
