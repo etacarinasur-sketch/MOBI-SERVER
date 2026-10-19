@@ -1510,7 +1510,7 @@ function histIngest(room, msg) {
   /* V495 · viajes por pasajero (para el buscador de Administración) */
   /* V513 · el pasajero real del viaje sale de quién pidió el viaje (antes se tomaba un dato del celular del conductor) */
   const tsk = d.tripKey ? tripPax.get(room.name + '|' + String(d.tripKey)) || '' : '', idt = tsk ? paxIdentOfSk(room, tsk) : '';
-  const pid = idt.startsWith('pax:') ? idt.slice(4) : (tsk ? 'sk:' + tsk : String(it.paxId || (d.sum && d.sum.paxId) || ''));
+  const pid = idt.startsWith('pax:') ? idt.slice(4) : (tsk ? 'sk:' + tsk : '');   /* V516 · sin saber quién pidió el viaje no se anota (antes caía en el pasajero del celular del conductor) */
   if (pid) { const pk = HK(room, 'p:' + pid), pl = dHist.get(pk) || []; if (!pl.some((x) => x.id === id)) { const sd = (d.sum && d.sum.driver) || {}; pl.push({ id, at: Number(it.at) || Date.now(), fare: Number(it.fare) || 0, route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), drvName: String(sd.name || '').slice(0, 60), plate: String(sd.plate || (d.ledger && d.ledger.plate) || '').slice(0, 12), driverId: String(it.driverId || '') }); if (pl.length > 1500) pl.splice(0, pl.length - 1500); dHist.set(pk, pl); dDirty.add('dhist|' + pk); } }
 }
 function presIngest(room, msg) {
@@ -1560,17 +1560,34 @@ app.post('/api/my/history', (req, res) => {
   if (!okD && !okP && !au.sk) return res.status(403).json({ ok: false, error: 'forbidden' });
   const byId = new Map();   /* viajes de conductores por id (para completar los del pasajero viejos) */
   if (okP) for (const [k, l] of dHist) if (k.startsWith(r.name + '|') && !k.startsWith(r.name + '|p:')) for (const x of l) byId.set(x.id, Object.assign({ driverId: k.slice(r.name.length + 1) }, x));
-  if (okD) for (const x of (dHist.get(HK(r, drv)) || [])) out.drv.push({ id: 'srv_' + x.id, at: x.at, route: x.route, stop: x.stop, fare: x.fare, net: x.net, fee: x.fee, payment: x.payment, status: x.status || 'Finalizado', other: x.pax, driverId: drv, srv: 1 });
+  if (okD) for (const x of (dHist.get(HK(r, drv)) || [])) out.drv.push({ id: 'srv_' + x.id, at: x.at, route: x.route, stop: x.stop, fare: x.fare, net: x.net, fee: x.fee, payment: x.payment, status: x.status || 'Finalizado', other: x.pax, driverId: drv, srv: 1, bad: x.bad ? true : undefined });
   const okS = !!au.sk && !au.admin;   /* viajes pedidos desde ESTE celular aunque la cuenta no esté vinculada */
   if (okS && !byId.size) for (const [k, l] of dHist) if (k.startsWith(r.name + '|') && !k.startsWith(r.name + '|p:')) for (const x of l) byId.set(x.id, Object.assign({ driverId: k.slice(r.name.length + 1) }, x));
   const paxLists = [].concat(okP ? (dHist.get(HK(r, 'p:' + pax)) || []) : [], okS ? (dHist.get(HK(r, 'p:sk:' + au.sk)) || []) : []), seenP = new Set();
   if (paxLists.length) for (const x of paxLists) {
     if (seenP.has(x.id)) continue; seenP.add(x.id);
     const dx = byId.get(x.id) || {};
-    out.pax.push({ id: 'srv_' + x.id, at: x.at, route: x.route || dx.route || '', stop: x.stop || dx.stop || '', fare: x.fare || dx.fare || 0, payment: x.payment || dx.payment || '', status: x.status || dx.status || 'Finalizado', other: x.drvName || '', plate: x.plate || dx.plate || '', paxId: pax, driverId: x.driverId || dx.driverId || '', srv: 1 });
+    if (!x.route && !x.bad) continue;   /* V514 · anotaciones viejas mal hechas (eran del conductor) */
+    if (au.sk && ownHas(r, 'drv', String(x.driverId || dx.driverId || ''), au.sk)) continue;   /* un viaje que manejaste vos no es un viaje tuyo como pasajero */
+    out.pax.push({ id: 'srv_' + x.id, at: x.at, route: x.route || dx.route || '', stop: x.stop || dx.stop || '', fare: x.fare || dx.fare || 0, payment: x.payment || dx.payment || '', status: x.status || dx.status || 'Finalizado', bad: x.bad ? true : undefined, other: x.drvName || '', plate: x.plate || dx.plate || '', paxId: pax, driverId: x.driverId || dx.driverId || '', srv: 1 });
   }
   out.drv.sort((p, q) => q.at - p.at); out.pax.sort((p, q) => q.at - p.at);
   res.json({ ok: true, drv: out.drv.slice(0, 300), pax: out.pax.slice(0, 300) });
+});
+
+/* V514 · cancelaciones al historial del servidor (solo la anota quien participó: conductor dueño de su cuenta o el celular que pidió el viaje) */
+app.post('/api/my/cancel', (req, res) => {
+  const b = req.body || {}, r = getRoom(b.room), au = authOf(req, r.name), it = b.item || {}, tk = String(b.tripKey || '').slice(0, 80);
+  if (!tk || !au.sk) return res.status(400).json({ ok: false });
+  const rec = { id: 'c_' + tk, at: Math.min(Date.now(), Number(it.at) || Date.now()), route: String(it.route || '').slice(0, 200), fare: 0, net: 0, fee: 0, payment: '—', status: String(it.status || 'Cancelado').slice(0, 40), bad: true };
+  let key = '';
+  if (b.role === 'drv') { const drv = String(b.drv || ''); if (!OWN_RE.drv.test(drv) || !ownHas(r, 'drv', drv, au.sk)) return res.status(403).json({ ok: false }); key = HK(r, drv); rec.pax = String(it.other || '').slice(0, 60); }
+  else {
+    const tsk = tripPax.get(r.name + '|' + tk) || ''; if (tsk && tsk !== au.sk && !(OWN_RE.pax.test(String(b.pax || '')) && ownHas(r, 'pax', String(b.pax), au.sk) && paxIdentOfSk(r, tsk) === 'pax:' + b.pax)) return res.status(403).json({ ok: false });
+    const idt = paxIdentOfSk(r, au.sk); key = HK(r, 'p:' + (idt.startsWith('pax:') ? idt.slice(4) : 'sk:' + au.sk)); rec.drvName = String(it.other || '').slice(0, 60);
+  }
+  const l = dHist.get(key) || []; if (!l.some((x) => x.id === rec.id)) { l.push(rec); if (l.length > 1500) l.splice(0, l.length - 1500); dHist.set(key, l); dDirty.add('dhist|' + key); }
+  res.json({ ok: true });
 });
 
 /* V495 · estadísticas de usuarios para el buscador de Administración (viajes por conductor y por pasajero) */
@@ -1581,8 +1598,8 @@ app.post('/api/admin/user-stats', (req, res) => {
   const ids = (a) => (Array.isArray(a) ? a : []).map((x) => String(x || '')).filter(Boolean).slice(0, 2000);
   const seenT = new Set();
   const add = (kind, id, tid, at) => { const o = out[kind][id] || (out[kind][id] = { trips: 0, last: 0 }); o.trips++; if (at > o.last) o.last = at; seenT.add(kind + '|' + id + '|' + tid); };
-  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) add('drv', id, x.id, Number(x.at) || 0);
-  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) add('pax', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) if (!x.bad) add('drv', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) if (!x.bad) add('pax', id, x.id, Number(x.at) || 0);
   const wantD = new Set(ids(bd.drv)), wantP = new Set(ids(bd.pax));
   for (const m of r.sticky.values()) {   /* viajes que todavía están en el bus y no se anotaron */
     if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist)) continue;
@@ -1667,6 +1684,79 @@ app.post('/api/addr/verify', (req, res) => {
   addrMem.set(key, e); if (addrMem.size > 20000) addrMem.delete(addrMem.keys().next().value);
   kvSet('addr', key, e);
   res.json({ ok: true, verified: !!addrBest(e) });
+});
+
+/* ---------------- V515 · GOOGLE MAPS (direcciones exactas y navegación) ----------------
+   La clave vive SOLO en el servidor (variable GOOGLE_MAPS_KEY en Render). Si no está, o se pasa el tope diario, la app sigue con lo gratuito.
+   Topes diarios para no salir nunca de la cuota gratis (10.000 por mes y por servicio): GOOGLE_GEOCODE_DAY y GOOGLE_ROUTE_DAY (300 por defecto). */
+const GMK = String(process.env.GOOGLE_MAPS_KEY || '').trim();
+const G_GEO_URL = process.env.GOOGLE_GEOCODE_BASE || 'https://maps.googleapis.com', G_RT_URL = process.env.GOOGLE_ROUTES_BASE || 'https://routes.googleapis.com';
+const G_DAY = { geo: Number(process.env.GOOGLE_GEOCODE_DAY || 300), route: Number(process.env.GOOGLE_ROUTE_DAY || 300) };
+const gUse = { d: '', geo: 0, route: 0 };
+const gGeoCache = new Map(), gRate = new Map();
+function gAllow(kind, req) {
+  if (!GMK) return 'nokey';
+  const day = new Date(Date.now() - 3 * 3600_000).toISOString().slice(0, 10); if (gUse.d !== day) { gUse.d = day; gUse.geo = 0; gUse.route = 0; }
+  if (gUse[kind] >= G_DAY[kind]) return 'cap';
+  const who = String(req.headers['x-mobi-sk'] || req.ip || ''), now = Date.now(), r = gRate.get(who) || { n: 0, t: now };
+  if (now - r.t > 3600_000) { r.n = 0; r.t = now; } if (++r.n > 120) return 'rate'; gRate.set(who, r); if (gRate.size > 5000) gRate.delete(gRate.keys().next().value);
+  gUse[kind]++; return '';
+}
+function gDecode(str) {   /* polilínea codificada de Google → [[lat,lng],...] */
+  const out = []; let i = 0, lat = 0, lng = 0;
+  while (i < str.length) {
+    let b, sh = 0, r = 0; do { b = str.charCodeAt(i++) - 63; r |= (b & 31) << sh; sh += 5; } while (b >= 32); lat += (r & 1) ? ~(r >> 1) : (r >> 1);
+    sh = 0; r = 0; do { b = str.charCodeAt(i++) - 63; r |= (b & 31) << sh; sh += 5; } while (b >= 32); lng += (r & 1) ? ~(r >> 1) : (r >> 1);
+    out.push([lat / 1e5, lng / 1e5]);
+  }
+  return out;
+}
+app.get('/api/geo/status', (_req, res) => res.json({ ok: true, google: !!GMK, used: gUse, cap: G_DAY }));
+app.post('/api/geo/geocode', async (req, res) => {
+  const b = req.body || {}, q = String(b.q || '').trim().slice(0, 200);
+  if (q.length < 4) return res.status(400).json({ ok: false, error: 'q' });
+  const key = q.toLowerCase().replace(/\s+/g, ' '), hit = gGeoCache.get(key);
+  if (hit && Date.now() - hit.at < 30 * 86400_000) return res.json(Object.assign({ ok: true, cached: true }, hit.r));
+  const why = gAllow('geo', req); if (why) return res.json({ ok: false, error: why });
+  try {
+    let url = G_GEO_URL + '/maps/api/geocode/json?language=es&region=ar&components=country:AR&address=' + encodeURIComponent(q) + '&key=' + encodeURIComponent(GMK);
+    const lat = Number(b.lat), lng = Number(b.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) url += '&bounds=' + (lat - 0.35) + ',' + (lng - 0.45) + '|' + (lat + 0.35) + ',' + (lng + 0.45);
+    const r = await fetch(url), j = await r.json();
+    const x = j && Array.isArray(j.results) && j.results[0];
+    if (!x) { const out = { found: false, status: String((j && j.status) || '') }; gGeoCache.set(key, { at: Date.now(), r: out }); return res.json(Object.assign({ ok: true }, out)); }
+    const g = x.geometry || {}, t = String(g.location_type || ''), types = x.types || [];
+    const out = { found: true, lat: g.location.lat, lng: g.location.lng, label: String(x.formatted_address || ''), type: t, partial: !!x.partial_match,
+      exact: (t === 'ROOFTOP' || t === 'RANGE_INTERPOLATED') && (types.includes('street_address') || types.includes('premise') || types.includes('subpremise') || types.includes('establishment') || types.includes('point_of_interest')) };
+    gGeoCache.set(key, { at: Date.now(), r: out }); if (gGeoCache.size > 20000) gGeoCache.delete(gGeoCache.keys().next().value);
+    res.json(Object.assign({ ok: true }, out));
+  } catch (e) { res.json({ ok: false, error: 'google' }); }
+});
+const G_MAN = { TURN_LEFT: ['turn', 'left'], TURN_RIGHT: ['turn', 'right'], TURN_SLIGHT_LEFT: ['turn', 'slight left'], TURN_SLIGHT_RIGHT: ['turn', 'slight right'], TURN_SHARP_LEFT: ['turn', 'sharp left'], TURN_SHARP_RIGHT: ['turn', 'sharp right'],
+  UTURN_LEFT: ['turn', 'uturn'], UTURN_RIGHT: ['turn', 'uturn'], STRAIGHT: ['continue', 'straight'], RAMP_LEFT: ['off ramp', 'left'], RAMP_RIGHT: ['off ramp', 'right'], MERGE: ['merge', ''], FORK_LEFT: ['fork', 'left'], FORK_RIGHT: ['fork', 'right'],
+  ROUNDABOUT_LEFT: ['roundabout', ''], ROUNDABOUT_RIGHT: ['roundabout', ''], DEPART: ['depart', ''], NAME_CHANGE: ['new name', ''] };
+app.post('/api/geo/route', async (req, res) => {
+  const b = req.body || {}, o = b.o || {}, d = b.d || {};
+  const ok = (p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)) && Math.abs(Number(p.lat)) <= 90 && Math.abs(Number(p.lng)) <= 180;
+  if (!ok(o) || !ok(d)) return res.status(400).json({ ok: false, error: 'datos' });
+  const why = gAllow('route', req); if (why) return res.json({ ok: false, error: why });
+  try {
+    const wp = (p) => ({ location: Object.assign({ latLng: { latitude: Number(p.lat), longitude: Number(p.lng) } }, Number.isFinite(Number(p.heading)) && p.heading !== null ? { heading: Math.round(Number(p.heading)) % 360 } : {}) });
+    const body = { origin: wp(o), destination: wp({ lat: d.lat, lng: d.lng }), travelMode: 'DRIVE', routingPreference: 'TRAFFIC_UNAWARE', languageCode: 'es-419', units: 'METRIC' };
+    const r = await fetch(G_RT_URL + '/directions/v2:computeRoutes', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GMK,
+      'X-Goog-FieldMask': 'routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.startLocation,routes.legs.steps.navigationInstruction' }, body: JSON.stringify(body) });
+    const j = await r.json(), rt = j && Array.isArray(j.routes) && j.routes[0];
+    if (!rt || !rt.polyline) return res.json({ ok: false, error: 'sin_ruta' });
+    const coords = gDecode(String(rt.polyline.encodedPolyline || ''));
+    const steps = [];
+    for (const lg of rt.legs || []) for (const st of lg.steps || []) {
+      const ni = st.navigationInstruction || {}, mm = G_MAN[ni.maneuver] || ['continue', ''], ll = st.startLocation && st.startLocation.latLng;
+      steps.push({ t: mm[0], m: mm[1], x: 0, n: '', g: String(ni.instructions || '').replace(/\s+/g, ' ').slice(0, 160), loc: ll ? [ll.latitude, ll.longitude] : null, d: Number(st.distanceMeters) || 0 });
+    }
+    if (coords.length) steps.push({ t: 'arrive', m: '', x: 0, n: '', g: '', loc: coords[coords.length - 1], d: 0 });
+    const sec = parseFloat(String(rt.duration || '0').replace('s', '')) || 0;
+    res.json({ ok: true, src: 'google', coords, km: (Number(rt.distanceMeters) || 0) / 1000, min: sec / 60, steps });
+  } catch (e) { res.json({ ok: false, error: 'google' }); }
 });
 
 /* V474 · acierto de cada fuente de direcciones: cuánto se equivocó el punto que mostró la lista frente a lo que confirmó la gente */
@@ -1889,7 +1979,7 @@ app.post('/api/addr/find', (req, res) => {
   const q = String((req.body || {}).q || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').slice(0, 60).trim();
   if (q.length < 3) return res.json({ ok: true, items: [] });
   const items = [];
-  for (const [k, e] of addrMem) { if (!k.startsWith(q + '|')) continue; const b = addrBest(e); if (b) items.push({ key: k, label: e.label, lat: b.lat, lng: b.lng, w: b.w }); if (items.length >= 5) break; }
+  for (const [k, e] of addrMem) { if (!k.startsWith(q + '|')) continue; const b = addrBest(e); if (b) items.push({ key: k, label: e.label, lat: b.lat, lng: b.lng, w: b.w }); if (items.length >= 15) break; }
   res.json({ ok: true, items });
 });
 
