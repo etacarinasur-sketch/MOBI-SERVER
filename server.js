@@ -248,13 +248,18 @@ function authOf(req, room) {
 const OWN_RE = { drv: /^drv_[a-z0-9]{3,24}$/, pax: /^pax_[a-z0-9]{3,24}$/ };
 function ownKey(room, kind, id) { return (typeof room === 'string' ? room : room.name) + '|' + kind + '|' + id; }
 function ownGet(room, kind, id) { return ownMap.get(ownKey(room, kind, id)) || ''; }
-function ownSet(room, kind, id, sk) { if (!sk) return; const k = ownKey(room, kind, id); if (ownMap.get(k) === sk) return; ownMap.set(k, sk); kvSet('own', k, { h: sk, at: Date.now() }); }
-/* el dueño: si la cuenta todavía no tiene celular asignado, queda con el primero que la usa */
+function ownHas(room, kind, id, sk) { return !!sk && ownGet(room, kind, id).split(',').includes(sk); }
+/* V504 · una cuenta puede usarse en hasta 2 celulares/navegadores del mismo dueño (APK + navegador). El segundo se suma solo al verificar la cuenta («Ya tengo cuenta»); un tercero reemplaza al más viejo. */
+function ownSet(room, kind, id, sk, add) {
+  if (!sk) return; const k = ownKey(room, kind, id), cur = ownMap.get(k) || '';
+  let list = add && cur ? [sk].concat(cur.split(',').filter((x) => x && x !== sk)).slice(0, 2) : [sk];
+  const v = list.join(','); if (cur === v) return; ownMap.set(k, v); kvSet('own', k, { h: v, at: Date.now() });
+}
 function isOwner(room, kind, id, sk, bind) {
   if (!sk || !OWN_RE[kind] || !OWN_RE[kind].test(String(id || ''))) return false;
   const cur = ownGet(room, kind, id);
   if (!cur) { if (bind) ownSet(room, kind, id, sk); return !!bind; }
-  return cur === sk;
+  return cur.split(',').includes(sk);
 }
 /* cuentas creadas antes de la V500 (todavía sin celular asignado): quedan con el primer celular que las usa */
 function legacyBind(room, kind, id) { return !ownGet(room, kind, id) && !!stickyData(room, (kind === 'pax' ? 'pax-reg|pr:' : 'driver-reg|dr:') + id); }
@@ -358,15 +363,15 @@ function viewFor(room, x, auth) {
   if (auth.admin) return x;
   const t = x.type, d = x.data;
   if (!d || typeof d !== 'object') return x;
-  if (t === 'pax-reg') return ownGet(room, 'pax', String(d.id || '')) === auth.sk && auth.sk ? x : null;
-  if (t === 'pax-chg') return ownGet(room, 'pax', String(d.id || '')) === auth.sk && auth.sk ? x : null;
+  if (t === 'pax-reg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
+  if (t === 'pax-chg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'driver-reg') {
-    if (auth.sk && ownGet(room, 'drv', String(d.id || '')) === auth.sk) return x;
+    if (ownHas(room, 'drv', String(d.id || ''), auth.sk)) return x;
     const o = {}; DRV_PUBLIC.forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; });
     if (Array.isArray(d.cars)) o.cars = d.cars.map((c) => c && ({ model: c.model, plate: c.plate, color: c.color, status: c.status }));
     return Object.assign({}, x, { data: o });
   }
-  if (t === 'drv-chg' || t === 'debt-charge' || t === 'debt-pay') return auth.sk && ownGet(room, 'drv', String(d.id && t === 'drv-chg' ? d.id : d.driver || '')) === auth.sk ? x : null;
+  if (t === 'drv-chg' || t === 'debt-charge' || t === 'debt-pay') return ownHas(room, 'drv', String(d.id && t === 'drv-chg' ? d.id : d.driver || ''), auth.sk) ? x : null;
   return x;
 }
 app.post('/api/reg/check', (req, res) => {
@@ -1738,7 +1743,7 @@ app.post('/api/account/find', async (req, res) => {
   let drvDocs = null;
   if (drv && drv.id) drvDocs = await docsOf(drv.id);
   { const sk = authOf(req, 'pilot').sk;   /* V500 · verificado por Telegram o mail: la cuenta pasa a este celular */
-    if (sk) for (const room of rooms.values()) { if (pax && pax.id && room.sticky.has('pax-reg|pr:' + pax.id)) ownSet(room, 'pax', String(pax.id), sk); if (drv && drv.id && room.sticky.has('driver-reg|dr:' + drv.id)) ownSet(room, 'drv', String(drv.id), sk); } }
+    if (sk) for (const room of rooms.values()) { if (pax && pax.id && room.sticky.has('pax-reg|pr:' + pax.id)) ownSet(room, 'pax', String(pax.id), sk, true); if (drv && drv.id && room.sticky.has('driver-reg|dr:' + drv.id)) ownSet(room, 'drv', String(drv.id), sk, true); } }
   if (pax) delete pax._w; if (drv) { delete drv._w; delete drv._r; }
   console.log('Recuperar cuenta · …' + v.tail.slice(-4), 'vía ' + (v.via || '?'), pax ? 'pasajero' : '', drv ? 'conductor(' + String(drv.status || 'borrador') + ')' : '');
   res.json({ ok: true, pax, drv, drvDocs });
