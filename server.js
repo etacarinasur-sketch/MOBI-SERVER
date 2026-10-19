@@ -1508,8 +1508,10 @@ function histIngest(room, msg) {
   if (l.length > 1500) l.splice(0, l.length - 1500);
   dHist.set(k, l); dDirty.add('dhist|' + k);
   /* V495 · viajes por pasajero (para el buscador de Administración) */
-  const pid = String(it.paxId || (d.sum && d.sum.paxId) || '');
-  if (pid) { const pk = HK(room, 'p:' + pid), pl = dHist.get(pk) || []; if (!pl.some((x) => x.id === id)) { pl.push({ id, at: Number(it.at) || Date.now(), fare: Number(it.fare) || 0 }); if (pl.length > 1500) pl.splice(0, pl.length - 1500); dHist.set(pk, pl); dDirty.add('dhist|' + pk); } }
+  /* V513 · el pasajero real del viaje sale de quién pidió el viaje (antes se tomaba un dato del celular del conductor) */
+  const tsk = d.tripKey ? tripPax.get(room.name + '|' + String(d.tripKey)) || '' : '', idt = tsk ? paxIdentOfSk(room, tsk) : '';
+  const pid = idt.startsWith('pax:') ? idt.slice(4) : (tsk ? 'sk:' + tsk : String(it.paxId || (d.sum && d.sum.paxId) || ''));
+  if (pid) { const pk = HK(room, 'p:' + pid), pl = dHist.get(pk) || []; if (!pl.some((x) => x.id === id)) { const sd = (d.sum && d.sum.driver) || {}; pl.push({ id, at: Number(it.at) || Date.now(), fare: Number(it.fare) || 0, route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), drvName: String(sd.name || '').slice(0, 60), plate: String(sd.plate || (d.ledger && d.ledger.plate) || '').slice(0, 12), driverId: String(it.driverId || '') }); if (pl.length > 1500) pl.splice(0, pl.length - 1500); dHist.set(pk, pl); dDirty.add('dhist|' + pk); } }
 }
 function presIngest(room, msg) {
   const d = msg.data; if (!d || !d.id) return;
@@ -1546,6 +1548,29 @@ app.post('/api/admin/driver-history', (req, res) => {
   const s = dSess.get(k) || { list: [], cur: null }, now = Date.now();
   const sessions = s.list.slice(-200).concat(s.cur ? [{ from: s.cur.from, to: s.cur.last, live: now - s.cur.last < 60_000 }] : []).reverse();
   res.json({ ok: true, trips: trips.slice(0, 500), totalTrips: trips.length, sessions: sessions.slice(0, 200), seenAt: Number(r.seen && r.seen.get(id)) || 0 });
+});
+
+/* V513 · «Mi historial» desde el servidor: los viajes no se pierden al reinstalar la app, cambiar de celular o pasar de la APK al navegador.
+   Solo el dueño de la cuenta (celular vinculado) puede pedir el suyo. */
+app.post('/api/my/history', (req, res) => {
+  const b = req.body || {}, r = getRoom(b.room), au = authOf(req, r.name);
+  const drv = String(b.drv || ''), pax = String(b.pax || ''), out = { drv: [], pax: [] };
+  const okD = OWN_RE.drv.test(drv) && (au.admin || ownHas(r, 'drv', drv, au.sk));
+  const okP = OWN_RE.pax.test(pax) && (au.admin || ownHas(r, 'pax', pax, au.sk));
+  if (!okD && !okP && !au.sk) return res.status(403).json({ ok: false, error: 'forbidden' });
+  const byId = new Map();   /* viajes de conductores por id (para completar los del pasajero viejos) */
+  if (okP) for (const [k, l] of dHist) if (k.startsWith(r.name + '|') && !k.startsWith(r.name + '|p:')) for (const x of l) byId.set(x.id, Object.assign({ driverId: k.slice(r.name.length + 1) }, x));
+  if (okD) for (const x of (dHist.get(HK(r, drv)) || [])) out.drv.push({ id: 'srv_' + x.id, at: x.at, route: x.route, stop: x.stop, fare: x.fare, net: x.net, fee: x.fee, payment: x.payment, status: x.status || 'Finalizado', other: x.pax, driverId: drv, srv: 1 });
+  const okS = !!au.sk && !au.admin;   /* viajes pedidos desde ESTE celular aunque la cuenta no esté vinculada */
+  if (okS && !byId.size) for (const [k, l] of dHist) if (k.startsWith(r.name + '|') && !k.startsWith(r.name + '|p:')) for (const x of l) byId.set(x.id, Object.assign({ driverId: k.slice(r.name.length + 1) }, x));
+  const paxLists = [].concat(okP ? (dHist.get(HK(r, 'p:' + pax)) || []) : [], okS ? (dHist.get(HK(r, 'p:sk:' + au.sk)) || []) : []), seenP = new Set();
+  if (paxLists.length) for (const x of paxLists) {
+    if (seenP.has(x.id)) continue; seenP.add(x.id);
+    const dx = byId.get(x.id) || {};
+    out.pax.push({ id: 'srv_' + x.id, at: x.at, route: x.route || dx.route || '', stop: x.stop || dx.stop || '', fare: x.fare || dx.fare || 0, payment: x.payment || dx.payment || '', status: x.status || dx.status || 'Finalizado', other: x.drvName || '', plate: x.plate || dx.plate || '', paxId: pax, driverId: x.driverId || dx.driverId || '', srv: 1 });
+  }
+  out.drv.sort((p, q) => q.at - p.at); out.pax.sort((p, q) => q.at - p.at);
+  res.json({ ok: true, drv: out.drv.slice(0, 300), pax: out.pax.slice(0, 300) });
 });
 
 /* V495 · estadísticas de usuarios para el buscador de Administración (viajes por conductor y por pasajero) */
