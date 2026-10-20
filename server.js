@@ -268,6 +268,7 @@ function isOwner(room, kind, id, sk, bind) {
 /* cuentas creadas antes de la V500 (todavía sin celular asignado): quedan con el primer celular que las usa */
 function legacyBind(room, kind, id) { return !ownGet(room, kind, id) && !!stickyData(room, (kind === 'pax' ? 'pax-reg|pr:' : 'driver-reg|dr:') + id); }
 function stickyData(room, k) { const m = room.sticky.get(k); return (m && m.data && typeof m.data === 'object') ? m.data : null; }
+function waViaFor(id, phone) { const v = waVerified.get(String(id || '')); return v && v.tail && v.tail === tail8(phone) ? (v.via || 'wa') : ''; }   /* V530 · por dónde verificó: wa / tg / mail */
 function waOkFor(id, phone) { const v = waVerified.get(String(id || '')); return !!(v && v.tail && v.tail === tail8(phone)); }
 const ADMIN_ONLY_DRV = ['reviewedAt', 'approvedAt', 'approvedSig', 'reason', 'hiddenAt', 'deletedAt'];
 const LOCK_APPROVED_DRV = ['name', 'dni', 'plate', 'vehicle', 'docSig', 'docs', 'registeredAt', 'submittedAt', 'submittedSig'];
@@ -370,11 +371,12 @@ function guardMsg(room, m, auth) {
       if (String(prev.phone || '').trim()) o.phone = prev.phone;                                          /* el celular no se cambia nunca */
       if (ps === 'aprobado' && o.status === 'aprobado') {
         LOCK_APPROVED_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
+        if (String(prev.email || '').trim()) o.email = prev.email;   /* V530 · el mail, una vez cargado, solo cambia con revisión */
         const pc = Array.isArray(prev.cars) ? prev.cars : [];
         if (Array.isArray(o.cars)) o.cars = o.cars.slice(0, 6).map((c) => { const old = pc.find((x) => x && c && String(x.plate || '') === String(c.plate || '')); return Object.assign({}, c, { status: old ? old.status : 'pendiente' }); });
       }
     } else { ADMIN_ONLY_DRV.forEach((k) => delete o[k]); }
-    o.wa = waOkFor(id, o.phone);
+    o.wa = waOkFor(id, o.phone); o.waVia = o.wa ? waViaFor(id, o.phone) : '';
     m.data = o; return m;
   }
   if (t === 'pax-reg') {
@@ -384,12 +386,12 @@ function guardMsg(room, m, auth) {
     if (!isOwner(room, 'pax', id, auth.sk, !prev || !ownGet(room, 'pax', id))) return null;
     const o = Object.assign({}, d);
     if (prev) {
-      ['name', 'dni', 'dniImg', 'at'].forEach((k) => { if (prev[k] !== undefined && String(prev[k] || '') !== '') o[k] = prev[k]; });   /* nombre y DNI: solo con revisión */
+      ['name', 'dni', 'dniImg', 'at', 'email'].forEach((k) => { if (prev[k] !== undefined && String(prev[k] || '') !== '') o[k] = prev[k]; });   /* nombre, DNI y (V530) mail: solo con revisión */
       if (String(prev.phone || '').trim()) o.phone = prev.phone;
       if (String(prev.photo || '')) o.photo = prev.photo;                                                  /* la foto de perfil, una vez cargada, no se cambia */
       ['deletedAt'].forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
     }
-    o.wa = waOkFor(id, o.phone);
+    o.wa = waOkFor(id, o.phone); o.waVia = o.wa ? waViaFor(id, o.phone) : '';
     m.data = o; return m;
   }
   if (t === 'pax-chg') {
@@ -488,8 +490,9 @@ function notOwnerMsg(room, m, auth) {
 /* qué ve cada celular de los datos de otros */
 const DRV_PUBLIC = ['id', 'name', 'status', 'plate', 'vehicle', 'registeredAt', 'submittedAt', 'reviewedAt', 'approvedAt', 'updatedAt', 'hiddenAt', 'deletedAt', 'wa', 'docs'];
 function viewFor(room, x, auth) {
-  if (auth.admin) return x;
+  if (auth.admin) { const d0 = x && x.data; if (x && (x.type === 'pax-reg' || x.type === 'driver-reg') && d0 && d0.wa && !d0.waVia) { const via = waViaFor(d0.id, d0.phone); if (via) return Object.assign({}, x, { data: Object.assign({}, d0, { waVia: via }) }); } return x; }   /* V530 · registros viejos: se agrega por dónde verificó */
   const t = x.type, d = x.data;
+  if (t === 'offer-lag') return null;   /* V532 · mediciones de demora: solo las ve el administrador */
   if (!d || typeof d !== 'object') return x;
   if (t === 'pax-reg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'pax-chg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
@@ -608,6 +611,28 @@ app.get('/api/bus', (req, res) => {
 });
 
 /* ------------- adjudicación atómica de viajes ------------- */
+/* V532 · el servicio nativo «Estás en línea» de la APK pregunta acá si hay pedidos esperando cerca (liviano: no baja todo el bus).
+   Solo para un conductor APROBADO, desde su propio celular. Así el aviso llega aunque Android haya dormido la app. */
+app.get('/api/drv/offers', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const q = req.query || {}, r = getRoom(String(q.room || '')), d = String(q.id || ''), lat = Number(q.lat), lng = Number(q.lng);
+  const au = authOf(req, r.name), dr = stickyData(r, 'driver-reg|dr:' + d);
+  if (!OWN_RE.drv.test(d) || (!au.admin && !isOwner(r, 'drv', d, au.sk, legacyBind(r, 'drv', d))) || !dr || dr.status !== 'aprobado' || drvHidden(dr) || dr.deletedAt || cupoWaiting(r, d)) return res.status(403).json({ ok: false });
+  const now = Date.now(), out = [], R = 6;
+  const km = (a, b) => { const t = Math.PI / 180, x = Math.sin((b.lat - a.lat) * t / 2), y = Math.sin((b.lng - a.lng) * t / 2), h = x * x + Math.cos(a.lat * t) * Math.cos(b.lat * t) * y * y; return 12742 * Math.asin(Math.sqrt(h)); };
+  const lab = (v) => v == null ? '' : (typeof v === 'object' ? String(v.label || '') : String(v));
+  for (const [key, m] of r.sticky) {
+    if (!m || m.type !== 'trip' || !/:pax$/.test(key) || !m.data || !m.data.active) continue;
+    const a = m.data.active, k = String(a.tripKey || ''); if (!k || now - Number(m.at || 0) > 240000) continue;
+    if (!/Esperando conductor|Buscando conductor|Solicitud/i.test(String(a.status || ''))) continue;
+    if (r.sticky.get('trip-end|te:' + k) || r.claims.get(k)) continue;
+    const o = a.originPlace || {}; let dist = null;
+    if (Number.isFinite(lat) && Number.isFinite(lng) && Number.isFinite(Number(o.lat)) && Number.isFinite(Number(o.lng))) { dist = km({ lat, lng }, { lat: Number(o.lat), lng: Number(o.lng) }); if (dist > R) continue; }
+    out.push({ k, from: lab(a.originPlace || a.origin).slice(0, 80), to: lab(a.destinationPlace || a.destination).slice(0, 80), fare: Number(a.fare) || 0, km: dist == null ? null : Math.round(dist * 10) / 10, env: a.kind === 'envio' ? 1 : 0 });
+    if (out.length >= 5) break;
+  }
+  res.json({ ok: true, at: now, offers: out });
+});
 app.post('/api/trip/claim', (req, res) => {
   const { room, tripKey, driverId } = req.body || {};
   if (!tripKey || !driverId) return res.status(400).json({ ok: false, error: 'tripKey and driverId are required' });
@@ -1395,7 +1420,7 @@ app.post('/api/admin/drvchg', async (req, res) => {
   if (!pend || pend.status !== 'pendiente') return res.status(409).json({ ok: false, error: 'sin_pedido' });
   if (status === 'aprobado' && cur) {
     const n = Object.assign({}, cur);
-    ['name', 'dni', 'plate', 'vehicle'].forEach((k) => { if (pend[k] !== undefined && String(pend[k] || '').trim()) n[k] = String(pend[k]).trim(); });
+    ['name', 'dni', 'plate', 'vehicle', 'email'].forEach((k) => { if (pend[k] !== undefined && String(pend[k] || '').trim()) n[k] = String(pend[k]).trim(); });
     const imgs = pend.imgs && typeof pend.imgs === 'object' ? pend.imgs : {};
     if (adminOk(b.token)) for (const kind of Object.keys(imgs)) { const img = String(imgs[kind] || ''); if (!['cedula', 'license', 'dniF', 'dniB', 'profile'].includes(kind) || !/^data:image\/(jpeg|png|webp);base64,/.test(img)) continue;
       const item = { img, at: Date.now() }; docMem.set(id + '|' + kind, item); await kvSet('doc', id + '|' + kind, item); n.docs = Object.assign({}, n.docs, { [kind]: true }); }
@@ -1403,7 +1428,7 @@ app.post('/api/admin/drvchg', async (req, res) => {
     pushMessage(rm, { type: 'driver-reg', key: 'dr:' + id, src: 'admin', data: n });
   }
   const data = { id, rid: String(pend.rid || '').slice(0, 40), status, reason: String(b.reason || '').slice(0, 200), at: Date.now() };
-  if (status === 'aprobado') Object.assign(data, { name: pend.name, dni: pend.dni, plate: pend.plate, vehicle: pend.vehicle, imgs: pend.imgs });   /* el celular del conductor guarda lo aprobado */
+  if (status === 'aprobado') Object.assign(data, { name: pend.name, dni: pend.dni, plate: pend.plate, vehicle: pend.vehicle, email: pend.email, imgs: pend.imgs });   /* el celular del conductor guarda lo aprobado */
   const saved = pushMessage(rm, { type: 'drv-chg', key: 'xc:' + id, src: 'admin', data });
   console.log('Cambio de datos de conductor', id, status);
   res.json({ ok: true, data: { id, status }, id: saved && saved.id });
