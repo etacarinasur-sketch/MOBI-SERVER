@@ -406,10 +406,10 @@ function guardMsg(room, m, auth) {
     }
     if (d.type !== 'credit') return null;
     /* saldo a favor: tiene que venir de un viaje real que hizo este conductor */
-    const k = String(d.tripKey || ''); if (!k) return null;
+    const k = String(d.tripKey || ''); if (!k) { console.log('Saldo a favor rechazado: sin viaje', drv, d.note || ''); return null; }
     const tr = stickyData(room, 'trip|tr:' + k + ':drv'), cl = room.claims.get(k);
     const who = String((tr && tr.active && tr.active.driver && tr.active.driver.id) || (cl && cl.driverId) || '');
-    if (who !== drv) return null;
+    if (who !== drv) { console.log('Saldo a favor rechazado: el viaje no es de este conductor', drv, who || '-', k); return null; }
     const kind = String(d.kind || ''), o = Object.assign({}, d); delete o.ver; delete o.hold; delete o.holdWhy; delete o.paxIdent; delete o.paxSk; delete o.releasedAt; o.at = Date.now();
     let n = 0, nc = 0; for (const x of room.sticky.values()) if (x && x.type === 'debt-charge' && x.data && x.data.type === 'credit' && String(x.data.tripKey || '') === k) { n++; if (isCancelCredit(x.data)) nc++; }
     if (n >= 3) return null;
@@ -423,6 +423,7 @@ function guardMsg(room, m, auth) {
       if (!(ident && have + 0.5 >= amt)) { o.hold = true; o.holdWhy = 'saldo'; }
       m.data = o; return m;
     }
+    if (hasCardCredit(room, k)) return null;   /* V520 · un solo saldo con tarjeta por viaje (aunque ya lo haya registrado el servidor) */
     /* viaje cobrado con tarjeta: tiene que haber un cobro real de Mercado Pago */
     const amt2 = Math.round(amt * 100) / 100; let ord = null;
     const pid = paxIdentOfTrip(room, k), byPax = (mo) => !mo.sk || !pid || paxIdentOfSk(room, mo.sk) === pid;   /* el cobro lo tuvo que hacer el pasajero de ESE viaje */
@@ -1304,7 +1305,34 @@ function commissionSweep(room, grace) {
     console.log('Comisión registrada por el servidor', drv, k, fee);
   }
 }
-setInterval(() => { for (const r of rooms.values()) { try { commissionSweep(r); } catch (e) { console.warn('comision', e.message); } } }, 5 * 60_000).unref();
+/* V520 · red de seguridad del saldo con tarjeta: si un viaje pagado con tarjeta terminó y el celular del conductor no registró su saldo a favor,
+   lo registra el servidor (uno solo por viaje, también para fundadores), ya sin la comisión de Mercado Pago */
+const CARD_GRACE = Number(process.env.CARD_GRACE_MS || 10 * 60_000);
+const hasCardCredit = (room, k) => { for (const y of room.sticky.values()) { const d = y && y.type === 'debt-charge' && y.data; if (d && d.type === 'credit' && String(d.tripKey || '') === k && !isCancelCredit(d) && d.kind !== 'paxcredit') return true; } return false; };
+function cardSweep(room, grace) {
+  const G = Number.isFinite(grace) ? grace : CARD_GRACE, now = Date.now(), lab = (v) => v == null ? '' : (typeof v === 'object' ? String(v.label || '') : String(v));
+  for (const [key, x] of room.sticky) {
+    if (!x || x.type !== 'trip' || !/:drv$/.test(key) || !x.data || !x.data.active) continue;
+    const a = x.data.active, k = String(a.tripKey || ''), st = String(a.status || '');
+    if (!k || !/^(Cobro pendiente|Finalizado|Entregado)$/i.test(st)) continue;
+    const age = now - Number(x.at || 0); if (age < G || age > 2 * 86400_000) continue;
+    const pax = stickyData(room, 'trip|tr:' + k + ':pax'), pa = (pax && pax.active) || {};
+    if (/Cancel/i.test(String(pa.status || '')) || !(a.paidOnline || pa.paidOnline)) continue;
+    const drv = String((a.driver && a.driver.id) || ''); if (!OWN_RE.drv.test(drv)) continue;
+    if (room.sticky.has('debt-charge|dc:card:' + k) || hasCardCredit(room, k)) continue;
+    const fare = Number(pa.fare || a.fare || 0), cf = Math.max(0, Math.min(fare, Number(pa.cancelFee || a.cancelFee || 0))); if (!(fare > 0)) continue;
+    const base = Math.round((fare - cf) * 100) / 100, fee = MP_FEE_PCT > 0 ? Math.round(base * MP_FEE_PCT) / 100 : 0;
+    const oid = String(pa.mpOrderId || a.mpOrderId || ''), mo = oid && mpOrders.get(oid), ok = !!(mo && (mo.ok || mo.auth) && !mo.credited && Number(mo.amount) + 0.01 >= base);
+    const data = { id: 'card_' + k.slice(0, 40), type: 'credit', amount: Math.round((base - fee) * 100) / 100, at: now, driver: drv, tripKey: k, route: (lab(a.origin) + ' → ' + lab(a.destination)).slice(0, 200),
+      note: 'Viaje cobrado por MOBI (tarjeta) · registrado por MOBI' + (fee > 0 ? ' · menos comisión de Mercado Pago ($' + Math.round(fee) + ')' : '') };
+    if (fee > 0) data.mpFee = fee;
+    if (ok) { mo.credited = drv; kvSet('mpord', oid, mo); data.mpOrd = oid; } else { data.hold = true; data.holdWhy = 'tarjeta'; }
+    pushMessage(room, { type: 'debt-charge', key: 'dc:card:' + k, src: 'admin', data });
+    console.log('Saldo con tarjeta registrado por el servidor', drv, k, data.amount, ok ? 'verificado' : 'retenido');
+  }
+}
+setInterval(() => { for (const r of rooms.values()) { try { commissionSweep(r); } catch (e) { console.warn('comision', e.message); } try { cardSweep(r); } catch (e) { console.warn('tarjeta', e.message); } } }, 5 * 60_000).unref();
+app.post('/api/admin/cardsweep', (req, res) => { const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false }); cardSweep(getRoom(b.room), Number.isFinite(Number(b.grace)) ? Number(b.grace) : undefined); res.json({ ok: true }); });
 app.post('/api/admin/commsweep', (req, res) => { const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false }); commissionSweep(getRoom(b.room), Number.isFinite(Number(b.grace)) ? Number(b.grace) : undefined); res.json({ ok: true }); });
 
 app.post('/api/admin/paxchg', (req, res) => {
