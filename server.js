@@ -58,7 +58,7 @@ const rooms = new Map();
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim()
   .replace(/([?&])channel_binding=[^&]*&?/, '$1').replace(/[?&]$/, '');   // Neon agrega channel_binding: node-postgres no lo necesita
 let waRegBlockUntil = 0;
-let db = null, dbState = DATABASE_URL ? 'starting' : 'off', dbError = '';
+let db = null, dbState = DATABASE_URL ? 'starting' : 'off', dbError = '', dbDownSince = 0;
 const dirty = new Map();
 let flushing = false;
 async function dbInit() {
@@ -74,6 +74,7 @@ async function dbInit() {
     const r = await db.query('SELECT room, k, msg FROM mobi_sticky');
     for (const row of r.rows) {
       const room = getRoom(row.room), msg = row.msg;
+      { const cur = room.sticky.get(row.k); if (cur && Number(cur.at || 0) > Number((msg && msg.at) || 0)) continue; }   /* V533 · al reconectar: lo nuevo en memoria no se pisa con lo viejo de la base */
       room.sticky.set(row.k, msg);
       if (Number(msg.id) > room.seq) room.seq = Number(msg.id);
     }
@@ -101,18 +102,29 @@ async function dbInit() {
     try { const ad = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'addr'`); for (const row of ad.rows) addrMem.set(row.id, row.data); } catch (e) { console.warn('addr', e.message); }
     try { const dl = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'dl' AND id = 'counts'`); if (dl.rows[0] && dl.rows[0].data) for (const k of DL_KINDS) { const o = dl.rows[0].data[k]; if (o) { dlStat[k].t = Number(o.t) || 0; dlStat[k].d = o.d || {}; } } } catch (e) { console.warn('dl', e.message); }
     try { const at = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'admtok'`); for (const row of at.rows) if (row.data && row.data.t && Number(row.data.exp) > Date.now()) adminTokens.set(String(row.data.t), Number(row.data.exp)); db.query(`DELETE FROM mobi_kv WHERE ns = 'admtok' AND at < now() - interval '13 hours'`).catch(() => {}); } catch (e) { console.warn('admtok', e.message); }
-    try { const tp = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'tpax' AND at > now() - interval '120 days'`); for (const row of tp.rows) if (row.data && row.data.h) tripPax.set(row.id, row.data.h); } catch (e) { console.warn('tpax', e.message); }
-    try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
-    try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
+    try { const tp = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'tpax' AND at > now() - interval '120 days'`); for (const row of tp.rows) if (row.data && row.data.h && !tripPax.has(row.id)) tripPax.set(row.id, row.data.h); } catch (e) { console.warn('tpax', e.message); }
+    try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h && !ownMap.has(row.id)) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
+    try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
-    for (const row of w.rows) waVerified.set(row.id, row.data);
+    for (const row of w.rows) if (!waVerified.has(row.id)) waVerified.set(row.id, row.data);
     try { const g = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'wacfg' AND id = 'regblock'`); if (g.rows[0]) waRegBlockUntil = Number(g.rows[0].data.until) || 0; } catch (e) {}
     dbState = 'on';
+    if (dbDownSince) {   /* V533 · la base volvió: se guarda lo que se hizo mientras estuvo caída */
+      let n = 0;
+      for (const room of rooms.values()) for (const [k, m] of room.sticky) if (m && DURABLE.has(m.type) && Number(m.at || 0) >= dbDownSince - 60000) { dirty.set(room.name + '\u0001' + k, { room: room.name, k, msg: m }); n++; }
+      for (const [id, h] of ownMap) kvSet('own', id, { h });
+      for (const [id, v] of waVerified) if (Number(v && v.at || 0) >= dbDownSince - 60000) kvSet('wa', id, v);
+      for (const [id, o] of mpOrders) if (Number(o && o.at || 0) >= dbDownSince - 60000) kvSet('mpord', id, o);
+      console.log('Base de datos RECUPERADA: se guardan ' + n + ' registros hechos mientras estuvo caída');
+      dbDownSince = 0;
+    }
     histLoad().catch(() => {});
     console.log(`Base de datos conectada: ${r.rows.length} registros, ${w.rows.length} verificaciones`);
   } catch (e) {
-    dbState = 'error'; dbError = e.message; db = null; pushLoaded = true;
-    console.warn('No se pudo conectar la base de datos (sigo en memoria):', e.message);
+    dbState = 'error'; dbError = e.message; try { if (db) db.end().catch(() => {}); } catch (e2) {} db = null; pushLoaded = true;
+    if (!dbDownSince) dbDownSince = Date.now();
+    console.warn('No se pudo conectar la base de datos (sigo en memoria, reintento en 60 s):', e.message);
+    setTimeout(() => { dbState = 'retrying'; dbInit().catch(() => {}); }, Number(process.env.DB_RETRY_MS || 60_000)).unref();   /* V533 · antes no reintentaba nunca: quedaba sin datos hasta el próximo reinicio */
   }
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
