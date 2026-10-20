@@ -1310,20 +1310,25 @@ function commissionSweep(room, grace) {
 const CARD_GRACE = Number(process.env.CARD_GRACE_MS || 10 * 60_000);
 const hasCardCredit = (room, k) => { for (const y of room.sticky.values()) { const d = y && y.type === 'debt-charge' && y.data; if (d && d.type === 'credit' && String(d.tripKey || '') === k && !isCancelCredit(d) && d.kind !== 'paxcredit') return true; } return false; };
 function cardSweep(room, grace) {
-  const G = Number.isFinite(grace) ? grace : CARD_GRACE, now = Date.now(), lab = (v) => v == null ? '' : (typeof v === 'object' ? String(v.label || '') : String(v));
+  /* se basa en el resumen final del viaje («trip-done»), que queda guardado en la base aunque el servidor se reinicie */
+  const G = Number.isFinite(grace) ? grace : CARD_GRACE, now = Date.now();
   for (const [key, x] of room.sticky) {
-    if (!x || x.type !== 'trip' || !/:drv$/.test(key) || !x.data || !x.data.active) continue;
-    const a = x.data.active, k = String(a.tripKey || ''), st = String(a.status || '');
-    if (!k || !/^(Cobro pendiente|Finalizado|Entregado)$/i.test(st)) continue;
-    const age = now - Number(x.at || 0); if (age < G || age > 2 * 86400_000) continue;
-    const pax = stickyData(room, 'trip|tr:' + k + ':pax'), pa = (pax && pax.active) || {};
-    if (/Cancel/i.test(String(pa.status || '')) || !(a.paidOnline || pa.paidOnline)) continue;
-    const drv = String((a.driver && a.driver.id) || ''); if (!OWN_RE.drv.test(drv)) continue;
+    if (!x || x.type !== 'trip-done' || !x.data || !x.data.sum) continue;
+    const d = x.data, sm = d.sum, k = String(d.tripKey || sm.tripKey || sm.tripId || '').slice(0, 80);
+    if (!k || !(sm.paidOnline || /tarjeta|mercado/i.test(String(sm.payment || '')))) continue;
+    const t0 = Number(sm.at || x.at || 0), age = now - Number(x.at || t0 || 0); if (age < G || now - t0 > 7 * 86400_000) continue;
+    const drv = String(sm.driverId || ''); if (!OWN_RE.drv.test(drv)) continue;
     if (room.sticky.has('debt-charge|dc:card:' + k) || hasCardCredit(room, k)) continue;
-    const fare = Number(pa.fare || a.fare || 0), cf = Math.max(0, Math.min(fare, Number(pa.cancelFee || a.cancelFee || 0))); if (!(fare > 0)) continue;
+    const fare = Number(sm.fare || 0), cf = Math.max(0, Math.min(fare, Number(sm.cf || 0))); if (!(fare > 0)) continue;
     const base = Math.round((fare - cf) * 100) / 100, fee = MP_FEE_PCT > 0 ? Math.round(base * MP_FEE_PCT) / 100 : 0;
-    const oid = String(pa.mpOrderId || a.mpOrderId || ''), mo = oid && mpOrders.get(oid), ok = !!(mo && (mo.ok || mo.auth) && !mo.credited && Number(mo.amount) + 0.01 >= base);
-    const data = { id: 'card_' + k.slice(0, 40), type: 'credit', amount: Math.round((base - fee) * 100) / 100, at: now, driver: drv, tripKey: k, route: (lab(a.origin) + ' → ' + lab(a.destination)).slice(0, 200),
+    const good = (mo) => mo && (mo.ok || mo.auth) && !mo.credited && mo.ref !== 'deuda' && Number(mo.amount) + 0.01 >= base;
+    let oid = String(sm.mpOrderId || ''), mo = oid && mpOrders.get(oid);
+    if (!good(mo)) {   /* sin número de cobro: se busca UN cobro real del mismo monto cerca de la hora del viaje */
+      const c = []; for (const [id, o] of mpOrders) if (good(o) && Math.abs(Number(o.amount) - fare) < 0.01 && Math.abs(Number(o.at || 0) - t0) < 3 * 3600_000) c.push([id, o]);
+      if (c.length === 1) { oid = c[0][0]; mo = c[0][1]; } else { oid = ''; mo = null; }
+    }
+    const ok = !!(mo && good(mo));
+    const data = { id: 'card_' + k.slice(0, 40), type: 'credit', amount: Math.round((base - fee) * 100) / 100, at: now, driver: drv, tripKey: k, route: (String(sm.origin || '') + ' → ' + String(sm.destination || '')).slice(0, 200),
       note: 'Viaje cobrado por MOBI (tarjeta) · registrado por MOBI' + (fee > 0 ? ' · menos comisión de Mercado Pago ($' + Math.round(fee) + ')' : '') };
     if (fee > 0) data.mpFee = fee;
     if (ok) { mo.credited = drv; kvSet('mpord', oid, mo); data.mpOrd = oid; } else { data.hold = true; data.holdWhy = 'tarjeta'; }
