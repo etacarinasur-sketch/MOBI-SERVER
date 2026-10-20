@@ -164,7 +164,7 @@ async function kvSet(ns, id, data) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'MOBI-SERVER', version: 5, database: dbState, databaseError: dbState === 'on' ? undefined : (dbError || undefined), mercadoPagoConfigured: Boolean(MP_ACCESS_TOKEN), adminConfigured: Boolean(ADMIN_KEY), whatsappConfigured: Boolean(WA_NUMBER), rooms: rooms.size, uptime: Math.round(process.uptime()) });
+  res.json({ ok: true, service: 'MOBI-SERVER', version: 5, database: dbState, databaseError: dbState === 'on' ? undefined : (dbError || undefined), mercadoPagoConfigured: Boolean(MP_ACCESS_TOKEN), adminConfigured: Boolean(ADMIN_KEY), whatsappConfigured: Boolean(WA_NUMBER), rooms: rooms.size, uptime: Math.round(process.uptime()), memMB: Math.round(process.memoryUsage().rss / 1048576) });
 });
 app.get('/api/config', (_req, res) => {
   res.json({ ok: true, mpPublicKey: MP_PUBLIC_KEY, mpEnabled: Boolean(MP_ACCESS_TOKEN), serverTime: Date.now() });
@@ -678,7 +678,7 @@ setInterval(() => { if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'claim' AND
 setInterval(() => {
   const now = Date.now();
   for (const [k, r] of rooms) {
-    if (now - r.touched > ROOM_TTL) { rooms.delete(k); continue; }
+    if (now - r.touched > (/^sandbox/.test(k) ? 3 * 3600_000 : ROOM_TTL)) { rooms.delete(k); continue; }   /* V535 · salas de prueba se sueltan a las 3 h sin uso */
     for (const [ck, c] of r.claims) if (now - c.at > 6 * 3600_000) r.claims.delete(ck);
   }
 }, 10 * 60_000).unref();
@@ -2157,6 +2157,17 @@ async function purgeUnverified() {
 }
 setTimeout(purgeUnverified, 60_000).unref();
 setInterval(purgeUnverified, 6 * 3600_000).unref();
+
+/* V535 · el servidor no se cae por un error suelto: se anota en el registro y sigue atendiendo */
+process.on('unhandledRejection', (e) => { console.warn('aviso: promesa sin manejar (el servidor sigue arriba):', (e && e.stack) || e); });
+process.on('uncaughtException', (e) => { console.error('aviso: error no capturado (el servidor sigue arriba):', (e && e.stack) || e); });
+
+/* V535 · mantenerlo despierto: Render (plan gratis) duerme el servicio tras 15 min sin visitas.
+   Cada 10 min se visita a sí mismo por la dirección pública. Se apaga con KEEPALIVE=0. */
+const SELF_URL = String(process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+if (SELF_URL && process.env.KEEPALIVE !== '0') {
+  setInterval(() => { fetch(SELF_URL + '/health?ka=1', { signal: AbortSignal.timeout(15_000) }).catch(() => {}); }, 10 * 60_000).unref();
+}
 
 await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
