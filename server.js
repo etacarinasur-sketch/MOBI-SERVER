@@ -238,6 +238,7 @@ function regBlocked(room, m) {
    - Datos personales (DNI, fotos, celulares, alias, movimientos): solo el administrador y el dueño de la cuenta.
    ===================================================================== */
 const ownMap = new Map();                 // 'sala|drv|id' o 'sala|pax|id' -> huella de la llave del celular
+const MP_FEE_PCT = Number.isFinite(Number(process.env.MP_FEE_PCT)) && process.env.MP_FEE_PCT !== '' ? Math.max(0, Math.min(15, Number(process.env.MP_FEE_PCT))) : 4.3;   /* V520 · comisión de Mercado Pago por pago con tarjeta (%) */
 const mpOrders = new Map();               // orderId -> { amount, ok, used, at }
 function skHash(v) { v = String(v || ''); return /^[a-f0-9]{32,64}$/.test(v) ? crypto.createHash('sha256').update('mobi-sk|' + v).digest('hex').slice(0, 40) : ''; }
 function authOf(req, room) {
@@ -431,6 +432,11 @@ function guardMsg(room, m, auth) {
       ord[1].credited = drv; kvSet('mpord', ord[0], ord[1]); o.mpOrd = ord[0];
       const cf = Math.round((Number(ord[1].amount) - amt2) * 100) / 100; if (cf > 0.5) releaseHolds(room, paxIdentOfTrip(room, k), cf, 'tarjeta');   /* lo que pagó de más con tarjeta = cargo de cancelación anterior */
     } else { o.hold = true; o.holdWhy = 'tarjeta'; }
+    /* V520 · Mercado Pago le cobra a MOBI una comisión por cada pago con tarjeta: se descuenta del saldo del conductor (porcentaje en MP_FEE_PCT, por defecto 4,3) */
+    if (MP_FEE_PCT > 0) {
+      const fee = Math.round(amt2 * MP_FEE_PCT) / 100;
+      if (fee > 0) { o.mpFee = fee; o.amount = Math.round((amt2 - fee) * 100) / 100; o.note = String(o.note || 'Viaje cobrado por MOBI (tarjeta)').replace(/ · menos comisión de Mercado Pago.*$/, '') + ' · menos comisión de Mercado Pago ($' + Math.round(fee) + ')'; }
+    }
     m.data = o; return m;
   }
   if (t === 'debt-pay') {
