@@ -238,6 +238,8 @@ function regBlocked(room, m) {
    - Datos personales (DNI, fotos, celulares, alias, movimientos): solo el administrador y el dueño de la cuenta.
    ===================================================================== */
 const ownMap = new Map();                 // 'sala|drv|id' o 'sala|pax|id' -> huella de la llave del celular
+const MP_RELEASE_DAYS = Number.isFinite(Number(process.env.MP_RELEASE_DAYS)) && process.env.MP_RELEASE_DAYS !== '' ? Math.max(0, Math.min(60, Number(process.env.MP_RELEASE_DAYS))) : 18;   /* V525 · días que tarda Mercado Pago en liberar un cobro con tarjeta */
+const isCardCredit = (y) => y && y.type === 'credit' && !isCancelCredit(y) && y.kind !== 'paxcredit' && (!!y.mpOrd || /tarjeta/i.test(String(y.note || '')));
 const MP_FEE_PCT = Number.isFinite(Number(process.env.MP_FEE_PCT)) && process.env.MP_FEE_PCT !== '' ? Math.max(0, Math.min(15, Number(process.env.MP_FEE_PCT))) : 4.3;   /* V520 · comisión de Mercado Pago por pago con tarjeta (%) */
 const mpOrders = new Map();               // orderId -> { amount, ok, used, at }
 function skHash(v) { v = String(v || ''); return /^[a-f0-9]{32,64}$/.test(v) ? crypto.createHash('sha256').update('mobi-sk|' + v).digest('hex').slice(0, 40) : ''; }
@@ -289,7 +291,7 @@ const isCancelCredit = (y) => y && y.type === 'credit' && (y.kind === 'cancel' |
 const isCollectCharge = (y) => y && y.type === 'charge' && (y.kind === 'cf-collect' || /^Cargo por cancelaci[oó]n que cobraste/i.test(String(y.note || '')));
 const isRefundCharge = (y) => y && y.type === 'charge' && y.kind === 'cancel-refund';
 function ledgerOf(room, drv) {
-  const L = { charges: 0, paid: 0, cred: 0, held: 0, cancelCr: 0, payDone: 0, payPend: 0, list: [] };
+  const L = { charges: 0, paid: 0, cred: 0, held: 0, cancelCr: 0, payDone: 0, payPend: 0, unrel: 0, nextRel: 0, list: [] }, now = Date.now();
   for (const x of room.sticky.values()) {
     const y = x && (x.type === 'debt-charge' || x.type === 'debt-pay') && x.data; if (!y || String(y.driver) !== drv) continue;
     L.list.push(y);
@@ -299,6 +301,9 @@ function ledgerOf(room, drv) {
       else if (y.type === 'credit') {
         if (y.hold || y.ver === false) { L.held += a; continue; }
         L.cred += a; if (isCancelCredit(y)) L.cancelCr += a;
+        /* V525 · cobro con tarjeta: Mercado Pago entrega la plata a los MP_RELEASE_DAYS días; hasta entonces suma al saldo pero no se puede retirar */
+        if (MP_RELEASE_DAYS > 0 && isCardCredit(y)) { const mo = y.mpOrd && mpOrders.get(String(y.mpOrd)), t0 = Number((mo && mo.at) || y.paidAt || y.at || 0), rel = t0 + MP_RELEASE_DAYS * 86400_000;
+          if (rel > now) { L.unrel += a; if (!L.nextRel || rel < L.nextRel) L.nextRel = rel; } }
       }
     } else if (y.type === 'payment' && y.status === 'confirmado') L.paid += a;
     else if (y.type === 'payout') { if (y.status === 'hecho') L.payDone += a; else if (y.status === 'pendiente') L.payPend += a; }
@@ -307,7 +312,8 @@ function ledgerOf(room, drv) {
   const netv = L.charges - L.paid - L.cred + L.payDone, favor = Math.max(0, -netv);
   const cancelLeft = Math.max(0, L.cancelCr - Math.max(0, L.charges - L.paid));   /* lo acreditado por cancelaciones solo baja deuda: no se retira */
   L.debt = r2(Math.max(0, netv)); L.favor = r2(favor);
-  L.avail = r2(Math.max(0, Math.max(0, favor - cancelLeft) - L.payPend));
+  L.avail = r2(Math.max(0, Math.max(0, favor - cancelLeft) - L.payPend - L.unrel));
+  L.unrel = r2(L.unrel);
   L.held = r2(L.held);
   L.list.sort((p, q) => Number(p.at || 0) - Number(q.at || 0));
   return L;
@@ -1268,7 +1274,7 @@ app.post('/api/debt/me', (req, res) => {
   if (!OWN_RE.drv.test(drv)) return res.status(400).json({ ok: false, error: 'datos' });
   if (!au.admin && !ownHas(r, 'drv', drv, au.sk)) return res.status(403).json({ ok: false, error: 'forbidden' });
   const L = ledgerOf(r, drv);
-  res.json({ ok: true, at: Date.now(), debt: L.debt, favor: L.favor, avail: L.avail, held: L.held, payPend: Math.round(L.payPend * 100) / 100, list: L.list.map((y) => { const o = Object.assign({}, y); delete o.paxIdent; delete o.paxSk; return o; }) });
+  res.json({ ok: true, at: Date.now(), debt: L.debt, favor: L.favor, avail: L.avail, held: L.held, unrel: L.unrel, nextRel: L.nextRel, relDays: MP_RELEASE_DAYS, payPend: Math.round(L.payPend * 100) / 100, list: L.list.map((y) => { const o = Object.assign({}, y); delete o.paxIdent; delete o.paxSk; return o; }) });
 });
 /* V510 · el administrador libera a mano un saldo retenido (por ejemplo, un cobro con tarjeta que no se pudo comprobar solo) */
 app.post('/api/admin/release', (req, res) => {
