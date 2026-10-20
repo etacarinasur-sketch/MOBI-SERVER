@@ -247,7 +247,7 @@ function authOf(req, room) {
   const h = req.headers || {}, b = req.body || {};
   const adm = String(h['x-mobi-adm'] || '');
   const admin = !!adm && (adminOk(adm) || sbxOk({ token: adm, room }));
-  return { admin, tried: !!adm && !admin, sk: skHash(h['x-mobi-sk']) };
+  return { admin, sbx: admin && !adminOk(adm), tried: !!adm && !admin, sk: skHash(h['x-mobi-sk']) };
 }
 const OWN_RE = { drv: /^drv_[a-z0-9]{3,24}$/, pax: /^pax_[a-z0-9]{3,24}$/ };
 function ownKey(room, kind, id) { return (typeof room === 'string' ? room : room.name) + '|' + kind + '|' + id; }
@@ -348,7 +348,14 @@ function guardMsg(room, m, auth) {
   const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'drv-chg';
   if (!SENS) return m;
   if (!d || typeof d !== 'object') return null;
-  if (auth.admin) return m;
+  if (auth.admin) {
+    /* V526 · en el sandbox (sala de prueba) el cobro con tarjeta también descuenta la comisión de Mercado Pago, igual que en la app real */
+    if (auth.sbx && t === 'debt-charge' && d.type === 'credit' && !d.mpFee && MP_FEE_PCT > 0 && isCardCredit(d)) {
+      const a0 = Math.round((Number(d.amount) || 0) * 100) / 100, fee = Math.round(a0 * MP_FEE_PCT) / 100;
+      if (fee > 0) m.data = Object.assign({}, d, { mpFee: fee, amount: Math.round((a0 - fee) * 100) / 100, note: String(d.note || 'Viaje cobrado por MOBI (tarjeta)') + ' · menos comisión de Mercado Pago ($' + Math.round(fee) + ')' });
+    }
+    return m;
+  }
   if (auth.tried) return null;   /* clave de administrador vencida: no se toma como un celular común (no se apropia de cuentas) */
   if (t === 'driver-reg') {
     const id = String(d.id || ''); if (!OWN_RE.drv.test(id)) return null;
@@ -1309,6 +1316,21 @@ function commissionSweep(room, grace) {
     const fee = Math.round((fare + pu - cf) * pct) / 100; if (!(fee > 0)) continue;
     pushMessage(room, { type: 'debt-charge', key: 'dc:com:' + k, src: 'admin', data: { id: 'com_' + k.slice(0, 40), type: 'charge', amount: fee, at: now, driver: drv, note: 'Comisión de viaje (' + pct + '%) · registrada por MOBI', fare, tripKey: k, srv: 1 } });
     console.log('Comisión registrada por el servidor', drv, k, fee);
+  }
+  /* V527 · también desde el resumen final del viaje («trip-done»), que queda guardado en la base: si Render reinicia el servidor, la red de seguridad no se pierde */
+  for (const x of room.sticky.values()) {
+    if (!x || x.type !== 'trip-done' || !x.data || !x.data.sum) continue;
+    const d = x.data, sm = d.sum, k = String(d.tripKey || sm.tripKey || '').slice(0, 80); if (!k) continue;
+    const t0 = Number(sm.at || x.at || 0); if (now - Number(x.at || t0) < G || now - t0 > 2 * 86400_000) continue;
+    const drv = String(sm.driverId || ''); if (!OWN_RE.drv.test(drv) || (fs.ids && fs.ids[drv])) continue;
+    if (room.sticky.has('debt-charge|dc:com:' + k) || room.sticky.has('pay-dispute|pd:pd_' + k)) continue;
+    const fare = Number(sm.fare || 0), cf = Math.max(0, Math.min(fare, Number(sm.cf || 0))); if (!(fare > 0)) continue;
+    if (charges.some((c) => String(c.driver) === drv && (String(c.tripKey || '') === k || (!c.tripKey && Math.abs(Number(c.fare || 0) - fare) < 1 && Math.abs(Number(c.at || 0) - t0) < 3 * 3600_000)))) continue;
+    const base = Number(sm.comm) > 0 && Number(sm.fee) > 0 ? Number(sm.fee) / Number(sm.comm) : fare - cf;
+    const fee = Math.round(base * pct) / 100; if (!(fee > 0)) continue;
+    pushMessage(room, { type: 'debt-charge', key: 'dc:com:' + k, src: 'admin', data: { id: 'com_' + k.slice(0, 40), type: 'charge', amount: fee, at: now, driver: drv, note: 'Comisión de viaje (' + pct + '%) · registrada por MOBI', fare, tripKey: k, srv: 1 } });
+    charges.push({ driver: drv, tripKey: k, fare, at: now });
+    console.log('Comisión registrada por el servidor (resumen del viaje)', drv, k, fee);
   }
 }
 /* V520 · red de seguridad del saldo con tarjeta: si un viaje pagado con tarjeta terminó y el celular del conductor no registró su saldo a favor,
