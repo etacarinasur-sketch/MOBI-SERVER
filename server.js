@@ -184,6 +184,28 @@ function getRoom(name) {
   return r;
 }
 
+
+/* V538 · MAIL AL REGISTRARSE · si en Render está REG_NOTIFY_TO (tu mail) y Gmail está configurado, avisa cada pasajero/conductor nuevo.
+   Máx. REG_NOTIFY_MAX por día (30 por defecto). Se apaga borrando la variable. Nunca frena el registro si falla. */
+const regMail = { d: '', n: 0, chain: Promise.resolve() };
+function regNotify(room, msg) {
+  const to = String(process.env.REG_NOTIFY_TO || '').trim(); if (!to || !GM_ON) return;
+  if (/sbx|sandbox|test/i.test(room.name)) return;
+  const t = msg.type, d = msg.data; if ((t !== 'pax-reg' && t !== 'driver-reg') || !d || typeof d !== 'object' || !msg.key) return;
+  const prev = room.sticky.get(t + '|' + msg.key), pd = prev && prev.data;
+  let fresh = false;
+  if (t === 'pax-reg') fresh = !prev && !!(d.name || d.phone);
+  else fresh = d.status === 'pendiente' && !(pd && (pd.status === 'pendiente' || pd.status === 'aprobado'));
+  if (!fresh) return;
+  const day = new Date().toISOString().slice(0, 10); if (regMail.d !== day) { regMail.d = day; regMail.n = 0; }
+  const max = Number(process.env.REG_NOTIFY_MAX) || 30; if (regMail.n >= max) return; regMail.n++;
+  const esc = (x) => String(x == null ? '' : x).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+  const who = t === 'pax-reg' ? 'Nuevo PASAJERO' : 'Nuevo CONDUCTOR (pendiente de aprobar)';
+  const rows = [['Nombre', ((d.name || '') + ' ' + (d.lastName || d.surname || '')).trim()], ['Celular', d.phone], ['Mail', d.email], ['Ciudad / zona', d.city || d.zone || d.localidad]].filter((r) => r[1]);
+  const html = '<div style="font-family:system-ui,sans-serif"><h3>' + who + '</h3>' + rows.map((r) => '<p><b>' + r[0] + ':</b> ' + esc(r[1]) + '</p>').join('') + '<p style="color:#666">Revisalo en Administración.</p></div>';
+  const text = who + '\n' + rows.map((r) => r[0] + ': ' + r[1]).join('\n') + '\nRevisalo en Administración.';
+  regMail.chain = regMail.chain.then(() => gmSend(to, '🆕 MOBI · ' + who.replace(/ \(.*/, ''), html, text)).catch((e) => console.log('regNotify', String(e && e.message || e).slice(0, 120)));
+}
 function pushMessage(room, m) {
   if (!m || typeof m.type !== 'string' || !m.type || m.type.length > 40) return null;
   const msg = {
@@ -205,6 +227,7 @@ function pushMessage(room, m) {
   else if (msg.type === 'chat' && msg.data && msg.data.tk) { msg.tk = String(msg.data.tk); msg.priv = 'pos'; if (!msg.key && msg.data.m && msg.data.m.id) msg.key = 'ch:' + String(msg.data.m.id).slice(0, 60); }   /* V469 · comprobantes y chat: solo a los dos del viaje (y al administrador) */
   if (msg.type === 'drv-pres' && msg.data && msg.data.id && msg.data.online !== false) { if (!room.seen) room.seen = new Map(); room.seen.set(String(msg.data.id), Date.now()); }   /* V473 · última vez conectado (para el cupo) */
   try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}   /* V485 · historial de conductores (viajes y conexiones) */
+  try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
