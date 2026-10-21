@@ -129,7 +129,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-reset', 'drv-chg']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg']);
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -532,7 +532,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -553,7 +553,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -1727,6 +1727,27 @@ app.post('/api/admin/user-stats', (req, res) => {
 /* V495 · MODO MANTENIMIENTO · lo activa el administrador y lo ve cualquier dispositivo (se reparte por el bus y se consulta por GET) */
 function maintGet(roomName) { const m = getRoom(roomName).sticky.get('cfg-maint|cfg:maint'); const d = m && m.data; return d && d.on ? { on: true, msg: String(d.msg || ''), eta: String(d.eta || ''), at: Number(d.at) || 0 } : { on: false, msg: '', eta: '', at: Number(d && d.at) || 0 }; }
 app.get('/api/maint', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(Object.assign({ ok: true, serverTime: Date.now(), reset: resetAtOf(getRoom(req.query.room)) }, maintGet(req.query.room))); });
+
+/* V537 · AVISO DE PRE-LANZAMIENTO · el administrador lo prende/apaga y escribe un texto para pasajeros y otro para conductores.
+   Se muestra una sola vez a quien está registrado (cada vez que se vuelve a ACTIVAR cuenta como aviso nuevo). Se reparte por el bus y se consulta por GET. */
+function prelClean(v, n) { return String(v == null ? '' : v).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').trim().slice(0, n); }
+function prelGet(roomName) {
+  const m = getRoom(roomName).sticky.get('cfg-prelaunch|cfg:prelaunch'), d = m && m.data;
+  const R = (x) => ({ title: prelClean(x && x.title, 80), text: prelClean(x && x.text, 600) });
+  if (!d || typeof d !== 'object') return { on: false, sid: 0, at: 0, pax: R(), drv: R() };
+  return { on: !!d.on, sid: Number(d.sid) || 0, at: Number(d.at) || 0, pax: R(d.pax), drv: R(d.drv) };
+}
+app.get('/api/prelaunch', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(Object.assign({ ok: true, serverTime: Date.now() }, prelGet(req.query.room))); });
+app.post('/api/admin/prelaunch', (req, res) => {
+  const bd = req.body || {};
+  if (!adminOk(bd.token) && !sbxOk(bd)) return res.status(401).json({ ok: false, error: 'admin' });
+  const prev = prelGet(bd.room), on = !!bd.on, R = (x) => ({ title: prelClean(x && x.title, 80), text: prelClean(x && x.text, 600) });
+  const now = Date.now(), sid = on ? ((prev.on && prev.sid) ? prev.sid : now) : prev.sid;
+  const data = { on, sid, at: now, pax: R(bd.pax), drv: R(bd.drv) };
+  const saved = pushMessage(getRoom(bd.room), { type: 'cfg-prelaunch', key: 'cfg:prelaunch', src: 'admin', data });
+  console.log('Aviso de pre-lanzamiento', on ? 'ACTIVADO' : 'desactivado');
+  res.json({ ok: true, data, id: saved && saved.id });
+});
 
 /* V497 · EMPEZAR DE CERO · borra registros de pasajeros y conductores, viajes, deudas, pagos, calificaciones, fundadores,
    verificaciones, fotos e historial. La configuración (precios, deuda, cupo, fundadores, avisos, mantenimiento) queda igual.
