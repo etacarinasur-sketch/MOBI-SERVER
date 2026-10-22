@@ -1919,8 +1919,8 @@ app.post('/api/geo/route', async (req, res) => {
 const addrStat = {};      // fuente -> { n, ok, sum, big }
 
 /* V503 · contador de descargas de la landing: { apk:{t:total, d:{'2026-10-18':n}}, web:{...} } */
-const DL_KINDS = ['apk', 'web', 'visit'];   /* V540 · 'visit' = visitas a la landing */
-const dlStat = { apk: { t: 0, d: {} }, web: { t: 0, d: {} }, visit: { t: 0, d: {} } };
+const DL_KINDS = ['apk', 'web'];
+const dlStat = { apk: { t: 0, d: {} }, web: { t: 0, d: {} } };
 const dlSeen = new Map();   /* hash(ip)+tipo → última vez (solo en memoria): un mismo celular no suma más de una vez cada 20 min */
 let dlTimer = null;
 function dlDay(ts) { return new Date((ts || Date.now()) - 3 * 3600_000).toISOString().slice(0, 10); }
