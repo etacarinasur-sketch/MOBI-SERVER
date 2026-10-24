@@ -228,6 +228,7 @@ function pushMessage(room, m) {
   if (msg.type === 'drv-pres' && msg.data && msg.data.id && msg.data.online !== false) { if (!room.seen) room.seen = new Map(); room.seen.set(String(msg.data.id), Date.now()); }   /* V473 · última vez conectado (para el cupo) */
   try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}   /* V485 · historial de conductores (viajes y conexiones) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
+  if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
@@ -740,7 +741,10 @@ app.post('/api/trip/claim', (req, res) => {
   const r = getRoom(room), k = String(tripKey), d = String(driverId);
   /* V470 · un pedido que el pasajero ya canceló no se puede tomar */
   const te = r.sticky.get('trip-end|te:' + k), tp = r.sticky.get('trip|tr:' + k + ':pax');
-  if (te || (tp && tp.data && tp.data.active && /Cancel/i.test(String(tp.data.active.status || '')))) return res.json({ ok: false, error: 'ended' });
+  /* V568 · un viaje ya TERMINADO no lo puede tomar nadie, ni el mismo conductor que lo hizo */
+  if (!r.doneTk) { r.doneTk = new Set(); for (const x of r.sticky.values()) if (x && x.type === 'trip-done' && x.data && x.data.tripKey) r.doneTk.add(String(x.data.tripKey)); }
+  const td = r.doneTk.has(k);
+  if (te || td || (tp && tp.data && tp.data.active && /Cancel/i.test(String(tp.data.active.status || '')))) return res.json({ ok: false, error: 'ended' });
   if (cupoWaiting(r, d)) return res.json({ ok: false, error: 'cupo' });   /* V473 · en lista de espera */
   { const au = authOf(req, r.name), dr = stickyData(r, 'driver-reg|dr:' + d);   /* V500 · solo un conductor APROBADO por el administrador, desde su propio celular, puede tomar viajes */
     if (!au.admin && (!isOwner(r, 'drv', d, au.sk, legacyBind(r, 'drv', d)) || !dr || dr.status !== 'aprobado' || drvHidden(dr) || dr.deletedAt)) return res.json({ ok: false, error: 'not_approved' }); }
