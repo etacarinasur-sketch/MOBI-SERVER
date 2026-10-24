@@ -415,6 +415,7 @@ function guardMsg(room, m, auth) {
       ADMIN_ONLY_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
       if (o.status === 'pendiente' && ps !== 'pendiente' && Number(d.submittedAt || 0) > Number(prev.hiddenAt || 0)) o.hiddenAt = prev.hiddenAt;   /* reenvío: vuelve a aparecer (el admin lo ve) */
       if (String(prev.phone || '').trim()) o.phone = keepPhone(prev.phone, o.phone);                      /* el celular no se cambia (V555: salvo completar uno incompleto) */
+      ['prov', 'zone', 'email', 'alias', 'color'].forEach((k) => { if (String(prev[k] || '').trim() && !String(o[k] || '').trim()) o[k] = prev[k]; });   /* V579 · lo ya declarado nunca se borra con un dato vacío */
       if (ps === 'aprobado' && o.status === 'aprobado') {
         LOCK_APPROVED_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
         if (String(prev.email || '').trim()) o.email = prev.email;   /* V530 · el mail, una vez cargado, solo cambia con revisión */
@@ -434,6 +435,7 @@ function guardMsg(room, m, auth) {
     if (prev) {
       ['name', 'dni', 'dniImg', 'at', 'email'].forEach((k) => { if (prev[k] !== undefined && String(prev[k] || '') !== '') o[k] = prev[k]; });   /* nombre, DNI y (V530) mail: solo con revisión */
       if (String(prev.phone || '').trim()) o.phone = keepPhone(prev.phone, o.phone);   /* V555 · completar un celular incompleto */
+      ['prov', 'zone', 'emName', 'emPhone', 'photo'].forEach((k) => { if (String(prev[k] || '').trim() && !String(o[k] || '').trim()) o[k] = prev[k]; });   /* V579 · lo ya declarado (provincia, zona…) nunca se borra con un dato vacío */
       if (String(prev.photo || '')) o.photo = prev.photo;                                                  /* la foto de perfil, una vez cargada, no se cambia */
       ['deletedAt'].forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
     }
