@@ -229,6 +229,12 @@ function pushMessage(room, m) {
   try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}   /* V485 · historial de conductores (viajes y conexiones) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
   if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
+  /* V571 · el administrador aprobó o rechazó un vehículo agregado (moto o auto): aviso al celular del conductor aunque tenga la app cerrada */
+  try { if (msg.type === 'driver-reg' && msg.key && msg.data && Array.isArray(msg.data.cars)) {
+    const pv = room.sticky.get('driver-reg|' + msg.key), pc = (pv && pv.data && Array.isArray(pv.data.cars)) ? pv.data.cars : null;
+    if (pc) for (const c of msg.data.cars) { const o = pc.find((x) => x && c && String(x.plate || '') === String(c.plate || '')); const st = String((c && c.status) || '');
+      if (o && (st === 'aprobado' || st === 'rechazado') && String(o.status || 'pendiente') !== st) { const mo = c.vtype === 'moto';
+        pushNotify(String(msg.data.id || ''), st === 'aprobado' ? { title: mo ? '🏍️ ¡Tu moto fue aprobada!' : '🚗 ¡Tu auto fue aprobado!', body: 'Ya podés trabajar con ' + (c.model || 'tu vehículo') + '. Abrí MOBI y elegilo en «Trabajás con».' } : { title: mo ? 'Tu moto no fue aprobada' : 'Tu auto no fue aprobado', body: 'Revisá los datos y la documentación de ' + (c.model || 'tu vehículo') + ' en Configuración.' }); } } } } catch (e) {}
   room.ring.push(msg);
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
