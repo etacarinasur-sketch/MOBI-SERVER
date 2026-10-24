@@ -129,7 +129,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg']);
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg']);   /* V558 · MOBI Flex (vendedores) */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -284,7 +284,7 @@ function authOf(req, room) {
   const admin = !!adm && (adminOk(adm) || sbxOk({ token: adm, room }));
   return { admin, sbx: admin && !adminOk(adm), tried: !!adm && !admin, sk: skHash(h['x-mobi-sk']) };
 }
-const OWN_RE = { drv: /^drv_[a-z0-9]{3,24}$/, pax: /^pax_[a-z0-9]{3,24}$/ };
+const OWN_RE = { drv: /^drv_[a-z0-9]{3,24}$/, pax: /^pax_[a-z0-9]{3,24}$/, seller: /^sel_[a-z0-9]{3,24}$/ };
 function ownKey(room, kind, id) { return (typeof room === 'string' ? room : room.name) + '|' + kind + '|' + id; }
 function ownGet(room, kind, id) { return ownMap.get(ownKey(room, kind, id)) || ''; }
 function ownHas(room, kind, id, sk) { return !!sk && ownGet(room, kind, id).split(',').includes(sk); }
@@ -306,7 +306,9 @@ function stickyData(room, k) { const m = room.sticky.get(k); return (m && m.data
 function waViaFor(id, phone) { const v = waVerified.get(String(id || '')); return v && v.tail && v.tail === tail8(phone) ? (v.via || 'wa') : ''; }   /* V530 · por dónde verificó: wa / tg / mail */
 function waOkFor(id, phone) { const v = waVerified.get(String(id || '')); return !!(v && v.tail && v.tail === tail8(phone)); }
 const ADMIN_ONLY_DRV = ['reviewedAt', 'approvedAt', 'approvedSig', 'reason', 'hiddenAt', 'deletedAt'];
-const LOCK_APPROVED_DRV = ['name', 'dni', 'plate', 'vehicle', 'docSig', 'docs', 'registeredAt', 'submittedAt', 'submittedSig'];
+const LOCK_APPROVED_DRV = ['name', 'dni', 'plate', 'vehicle', 'vtype', 'docSig', 'docs', 'registeredAt', 'submittedAt', 'submittedSig'];   /* V555 · el tipo (auto/moto) de un aprobado solo cambia con revisión */
+/* V555 · el celular no se cambia, salvo que el guardado esté incompleto (menos de 10 números) y el nuevo esté completo */
+function keepPhone(prevPh, newPh) { const a = String(prevPh || '').replace(/\D/g, ''), b = String(newPh || '').replace(/\D/g, ''); if (!a) return newPh; if (a.length < 10 && b.length >= 10) return newPh; return prevPh; }
 /* V509 · saldo a favor: el servidor verifica de dónde sale y pone topes (antes cualquiera podía inventar viajes y cancelarlos para bajar su deuda) */
 /* V510 · CUENTA DEL CONDUCTOR CALCULADA POR EL SERVIDOR
    - Lo que MOBI todavía no cobró NO se acredita: queda «retenido» (hold) y no baja la deuda ni se puede retirar.
@@ -381,6 +383,8 @@ function releaseHolds(room, ident, amount, why) {
 function guardMsg(room, m, auth) {
   if (!m || typeof m.type !== 'string') return m;
   const t = m.type, d = m.data;
+  const FLEX = t === 'seller-reg' || t === 'flex-pkg' || t === 'flex-run' || t === 'flex-cfg';
+  if (FLEX) return guardFlex(room, m, auth);
   const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'drv-chg';
   if (!SENS) return m;
   if (!d || typeof d !== 'object') return null;
@@ -403,7 +407,7 @@ function guardMsg(room, m, auth) {
     if (prev) {
       ADMIN_ONLY_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
       if (o.status === 'pendiente' && ps !== 'pendiente' && Number(d.submittedAt || 0) > Number(prev.hiddenAt || 0)) o.hiddenAt = prev.hiddenAt;   /* reenvío: vuelve a aparecer (el admin lo ve) */
-      if (String(prev.phone || '').trim()) o.phone = prev.phone;                                          /* el celular no se cambia nunca */
+      if (String(prev.phone || '').trim()) o.phone = keepPhone(prev.phone, o.phone);                      /* el celular no se cambia (V555: salvo completar uno incompleto) */
       if (ps === 'aprobado' && o.status === 'aprobado') {
         LOCK_APPROVED_DRV.forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
         if (String(prev.email || '').trim()) o.email = prev.email;   /* V530 · el mail, una vez cargado, solo cambia con revisión */
@@ -422,7 +426,7 @@ function guardMsg(room, m, auth) {
     const o = Object.assign({}, d);
     if (prev) {
       ['name', 'dni', 'dniImg', 'at', 'email'].forEach((k) => { if (prev[k] !== undefined && String(prev[k] || '') !== '') o[k] = prev[k]; });   /* nombre, DNI y (V530) mail: solo con revisión */
-      if (String(prev.phone || '').trim()) o.phone = prev.phone;
+      if (String(prev.phone || '').trim()) o.phone = keepPhone(prev.phone, o.phone);   /* V555 · completar un celular incompleto */
       if (String(prev.photo || '')) o.photo = prev.photo;                                                  /* la foto de perfil, una vez cargada, no se cambia */
       ['deletedAt'].forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
     }
@@ -522,11 +526,73 @@ function notOwnerMsg(room, m, auth) {
     const cur = ownGet(room, kind, id); return !!cur && !cur.split(',').includes(auth.sk);
   } catch (e) { return false; }
 }
+/* ===================== V558 · MOBI Flex: vendedores, paquetes y colectas =====================
+   seller-reg (sr:<id>)  · lo crea el vendedor; aprobar/rechazar solo el administrador
+   flex-pkg   (fp:<id>)  · lo carga el vendedor; el chofer de la colecta solo cambia el estado de la entrega
+   flex-run   (fr:<id>)  · la pide el vendedor; la toma el primer chofer (después nadie más); el chofer avanza los estados
+   flex-cfg   (cfg)      · precios: solo el administrador */
+const FLEX_ID = /^[a-z0-9_]{4,40}$/;
+const FLEX_DRV_PKG = ['status', 'deliveredAt', 'failedAt', 'failReason', 'proof', 'receiver', 'pickedAt', 'returnedAt', 'driver', 'driverName', 'upd'];
+const FLEX_DRV_RUN = ['status', 'driver', 'driverName', 'driverPhone', 'driverPlate', 'driverVehicle', 'driverVType', 'takenAt', 'atPickupAt', 'pickedAt', 'doneAt', 'pos', 'posAt', 'order', 'upd'];
+function guardFlex(room, m, auth) {
+  const t = m.type, d = m.data; if (!d || typeof d !== 'object') return null;
+  if (t === 'flex-cfg') { if (!auth.admin) return null; m.key = 'cfg'; return m; }
+  const id = String(d.id || ''); if (!FLEX_ID.test(id)) return null;
+  if (t === 'seller-reg') {
+    m.key = 'sr:' + id; if (auth.admin) return m;
+    const prev = stickyData(room, 'seller-reg|sr:' + id);
+    if (!isOwner(room, 'seller', id, auth.sk, !prev || !ownGet(room, 'seller', id))) return null;
+    const o = Object.assign({}, d), ps = String((prev && prev.status) || 'pendiente');
+    if (o.status !== ps && o.status !== 'pendiente') o.status = ps;                 /* aprobar o rechazar: solo el administrador */
+    if (prev && ps === 'aprobado') o.status = 'aprobado';
+    ['reviewedAt', 'reason', 'approvedAt'].forEach((k) => { if (prev && prev[k] !== undefined) o[k] = prev[k]; else delete o[k]; });
+    m.data = o; return m;
+  }
+  const seller = String(d.seller || '');
+  if (t === 'flex-pkg') {
+    m.key = 'fp:' + id; if (auth.admin) return m;
+    const prev = stickyData(room, 'flex-pkg|fp:' + id), sel = String((prev && prev.seller) || seller);
+    if (ownHas(room, 'seller', sel, auth.sk) || (!prev && isOwner(room, 'seller', sel, auth.sk, false))) { if (prev) m.data = Object.assign({}, d, { seller: sel }); return m; }
+    const drv = String(d.driver || '');   /* el chofer de la colecta de ese paquete: solo el estado de la entrega */
+    if (!prev || !drv || !ownHas(room, 'drv', drv, auth.sk)) return null;
+    const run = prev.run ? stickyData(room, 'flex-run|fr:' + String(prev.run)) : null;
+    if (!run || String(run.driver || '') !== drv) return null;
+    const o = Object.assign({}, prev); FLEX_DRV_PKG.forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; }); o.driver = drv; m.data = o; return m;
+  }
+  if (t === 'flex-run') {
+    m.key = 'fr:' + id; if (auth.admin) return m;
+    const prev = stickyData(room, 'flex-run|fr:' + id), sel = String((prev && prev.seller) || seller);
+    if (ownHas(room, 'seller', sel, auth.sk) || (!prev && isOwner(room, 'seller', sel, auth.sk, false))) {
+      if (prev && prev.driver) { const o = Object.assign({}, prev); if (d.status === 'cancelada' && /buscando|asignada/.test(String(prev.status))) { o.status = 'cancelada'; o.cancelledAt = Date.now(); o.upd = d.upd; } else return null; m.data = o; return m; }
+      return m;
+    }
+    if (!prev) return null;
+    const drv = String(d.driver || ''); if (!drv || !ownHas(room, 'drv', drv, auth.sk)) return null;
+    if (prev.driver && prev.driver !== drv) return null;                                  /* ya la tomó otro chofer */
+    if (!prev.driver && String(prev.status) !== 'buscando') return null;
+    const o = Object.assign({}, prev); FLEX_DRV_RUN.forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; }); o.driver = drv; m.data = o; return m;
+  }
+  return null;
+}
+function flexView(room, x, auth) {
+  const t = x.type, d = x.data || {};
+  if (t === 'flex-cfg') return x;
+  if (t === 'seller-reg') return ownHas(room, 'seller', String(d.id || ''), auth.sk) ? x : null;
+  if (t === 'flex-pkg') return (ownHas(room, 'seller', String(d.seller || ''), auth.sk) || (d.driver && ownHas(room, 'drv', String(d.driver), auth.sk))) ? x : null;
+  if (t === 'flex-run') {
+    if (ownHas(room, 'seller', String(d.seller || ''), auth.sk) || (d.driver && ownHas(room, 'drv', String(d.driver), auth.sk))) return x;
+    if (String(d.status) !== 'buscando') return Object.assign({}, x, { data: { id: d.id, status: 'no_disponible', upd: d.upd } });   /* ya la tomó otro: los demás solo se enteran de que no está más */
+    const o = {}; ['id', 'seller', 'status', 'business', 'pickup', 'count', 'price', 'pay', 'at', 'upd', 'vtypes'].forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; });
+    return Object.assign({}, x, { data: o });
+  }
+  return x;
+}
 /* qué ve cada celular de los datos de otros */
 const DRV_PUBLIC = ['id', 'name', 'status', 'plate', 'vehicle', 'registeredAt', 'submittedAt', 'reviewedAt', 'approvedAt', 'updatedAt', 'hiddenAt', 'deletedAt', 'wa', 'docs'];
 function viewFor(room, x, auth) {
   if (auth.admin) { const d0 = x && x.data; if (x && (x.type === 'pax-reg' || x.type === 'driver-reg') && d0 && d0.wa && !d0.waVia) { const via = waViaFor(d0.id, d0.phone); if (via) return Object.assign({}, x, { data: Object.assign({}, d0, { waVia: via }) }); } return x; }   /* V530 · registros viejos: se agrega por dónde verificó */
   const t = x.type, d = x.data;
+  if (t === 'seller-reg' || t === 'flex-pkg' || t === 'flex-run' || t === 'flex-cfg') return flexView(room, x, auth);   /* V558 */
   if (t === 'offer-lag') return null;   /* V532 · mediciones de demora: solo las ve el administrador */
   if (!d || typeof d !== 'object') return x;
   if (t === 'pax-reg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
