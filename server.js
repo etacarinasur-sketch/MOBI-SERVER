@@ -2086,10 +2086,12 @@ async function pushTouch(h, sub) {
     return { ok: r.ok, status: r.status };
   } catch (e) { console.warn('Push', e.message); pushLastStatus = { status: 0, at: Date.now(), err: String(e.message || e).slice(0, 80) }; return { ok: false, status: 0 }; }
 }
+/* V575 · un mismo celular puede recibir avisos como conductor y como pasajero (uid principal + uids) */
+function subUids(x) { const o = [String((x && x.uid) || '')]; if (x && Array.isArray(x.uids)) for (const u of x.uids) { const v = String(u || ''); if (v && !o.includes(v)) o.push(v); } return o.filter(Boolean); }
 function pushNotify(uid, note, acc) {
   if (note && note.skip) return 0; pushVapidEnsure(); if (!uid || !pushPriv) return 0; let n = 0;
   for (const [h, sub] of pushSubs) {
-    if (String(sub.uid) !== String(uid)) continue;
+    if (!subUids(sub).includes(String(uid))) continue;
     const q = pushQueue.get(h) || []; q.push({ title: String(note.title || 'MOBI').slice(0, 80), body: String(note.body || '').slice(0, 200), url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
     const pr = pushTouch(h, sub); if (acc) acc.push(pr); n++;
   }
@@ -2105,6 +2107,8 @@ app.post('/api/push/sub', (req, res) => {
   if (pushRate.size > 5000) pushRate.delete(pushRate.keys().next().value);
   if (pushSubs.size > 20000) return res.status(503).json({ ok: false });
   const rm = /^[a-zA-Z0-9_-]{1,40}$/.test(String(b.room || '')) ? String(b.room) : 'pilot', h = pushHash(ep), item = { endpoint: ep, uid, room: rm, at: now };
+  const ex = (Array.isArray(b.uids) ? b.uids : []).map((u) => String(u || '').slice(0, 60)).filter((u) => /^[A-Za-z0-9_.:-]{3,60}$/.test(u)).slice(0, 4);   /* V575 */
+  if (ex.length) item.uids = [...new Set([uid].concat(ex))];
   pushSubs.set(h, item); kvSet('push', h, item); res.json({ ok: true });
 });
 app.post('/api/push/pending', (req, res) => {
@@ -2164,7 +2168,7 @@ function pushTick() {
   const now = Date.now();
   for (const r of rooms.values()) {
     const subsHere = [...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name); if (!subsHere.length) continue;
-    const c = pushCfg(r), drv = pushDrivers(r), uids = [...new Set(subsHere.map((x) => String(x.uid)))].filter((id) => drv.has(id));
+    const c = pushCfg(r), drv = pushDrivers(r), uids = [...new Set(subsHere.flatMap((x) => subUids(x)))].filter((id) => drv.has(id));
     // 1) recordatorio periódico: nunca de noche; el primer ciclo arranca desde que el conductor activó los avisos
     if (c.periodic.on && !pushNight(c)) for (const id of uids) {
       const last = pushLast.periodic[id];
@@ -2199,7 +2203,7 @@ app.post('/api/admin/push-cfg', (req, res) => {
 });
 app.post('/api/admin/push-stats', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
-  const r = getRoom(b.room), drv = pushDrivers(r), subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
+  const r = getRoom(b.room), drv = pushDrivers(r), subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).flatMap((x) => subUids(x)));
   res.json({ ok: true, last: pushLastStatus, drivers: drv.size, subscribed: [...drv.keys()].filter((id) => subs.has(id)).length, cfg: pushCfg(r) });
 });
 /* V480 · prueba de aviso en el celular del administrador (no cuenta como conductor ni recibe avisos masivos) */
@@ -2220,7 +2224,7 @@ app.post('/api/admin/push-send', async (req, res) => {
   if (!title || !body) return res.status(400).json({ ok: false, error: 'texto' });
   if (!pushLoaded) return res.status(503).json({ ok: false });
   const r = getRoom(b.room), drv = pushDrivers(r), now = Date.now(), acc = []; let n = 0;
-  const subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).map((x) => String(x.uid)));
+  const subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).flatMap((x) => subUids(x)));
   for (const [id, x] of drv) {
     if (!subs.has(id)) continue;
     if (aud === 'recent' && now - x.seenAt > 24 * 3600_000) continue;
@@ -2228,6 +2232,29 @@ app.post('/api/admin/push-send', async (req, res) => {
     if (pushNotify(id, { title, body }, acc)) n++;
   }
   const rs = await Promise.all(acc); console.log('Aviso manual enviado a', n, 'conductores · aceptados por el servicio:', rs.filter((x) => x.ok).length); res.json({ ok: true, sent: n, eligible: drv.size, accepted: rs.filter((x) => x.ok).length, codes: rs.map((x) => x.status) });
+});
+
+/* V575 · aviso manual por ZONA, a pasajeros o a conductores (dry: solo cuenta a cuántos llega) */
+app.post('/api/admin/push-zone', async (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const role = b.role === 'drv' ? 'drv' : 'pax', prov = String(b.prov || '').trim(), zone = String(b.zone || '').trim();
+  const title = String(b.title || '').trim().slice(0, 80), body = String(b.body || '').trim().slice(0, 200);
+  if (!b.dry && (!title || !body)) return res.status(400).json({ ok: false, error: 'texto' });
+  const r = getRoom(b.room), ids = new Set();
+  for (const [k, m] of r.sticky) {
+    const d = m && m.data; if (!d || typeof d !== 'object' || !d.id || d.deletedAt) continue;
+    if (role === 'pax' ? !(m.type === 'pax-reg' && k.startsWith('pax-reg|pr:')) : !(m.type === 'driver-reg' && k.startsWith('driver-reg|dr:') && d.status === 'aprobado' && !drvHidden(d))) continue;
+    if (prov && String(d.prov || '').trim() !== prov) continue;
+    if (zone && String(d.zone || '').trim() !== zone) continue;
+    ids.add(String(d.id));
+  }
+  const subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === r.name).flatMap((x) => subUids(x)));
+  const reach = [...ids].filter((id) => subs.has(id));
+  if (b.dry) return res.json({ ok: true, people: ids.size, withPush: reach.length });
+  if (!pushLoaded) return res.status(503).json({ ok: false });
+  const acc = []; let n = 0; for (const id of reach) if (pushNotify(id, { title, body }, acc)) n++;
+  const rs = await Promise.all(acc); console.log('Aviso por zona', role, prov || 'todas', zone || '', '→', n);
+  res.json({ ok: true, people: ids.size, sent: n, accepted: rs.filter((x) => x.ok).length, codes: rs.map((x) => x.status) });
 });
 
 app.post('/api/addr/find', (req, res) => {
