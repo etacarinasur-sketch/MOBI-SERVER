@@ -1506,6 +1506,25 @@ setInterval(() => { for (const r of rooms.values()) { try { commissionSweep(r); 
 app.post('/api/admin/cardsweep', (req, res) => { const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false }); cardSweep(getRoom(b.room), Number.isFinite(Number(b.grace)) ? Number(b.grace) : undefined); res.json({ ok: true }); });
 app.post('/api/admin/commsweep', (req, res) => { const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false }); commissionSweep(getRoom(b.room), Number.isFinite(Number(b.grace)) ? Number(b.grace) : undefined); res.json({ ok: true }); });
 
+/* V574.14 · una persona = un nombre: el cambio aprobado de nombre, DNI o mail (sea como pasajero o como conductor)
+   se aplica también a su otra cuenta (mismo celular) y se le avisa a ese celular para que actualice los dos roles. */
+function crossRoleSync(rm, from, phone, vals) {
+  try {
+    const t = tail8(phone); if (!t || t.length < 6) return;
+    const v = {}; ['name', 'dni', 'email'].forEach((k) => { if (vals[k] !== undefined && vals[k] !== null && String(vals[k]).trim()) v[k] = String(vals[k]).trim(); });
+    if (!Object.keys(v).length) return;
+    for (const [k, m] of rm.sticky) {
+      if (!m || !m.data || typeof m.data !== 'object') continue;
+      const isPax = m.type === 'pax-reg' && k.startsWith('pax-reg|pr:'), isDrv = m.type === 'driver-reg' && k.startsWith('driver-reg|dr:');
+      if (!(isPax && from === 'drv') && !(isDrv && from === 'pax')) continue;
+      const d = m.data; if (d.deletedAt || tail8(d.phone) !== t) continue;
+      const n = Object.assign({}, d, v); if (isPax) n.upd = Date.now(); else { n.updatedAt = Date.now(); n.chgAt = Date.now(); }
+      pushMessage(rm, { type: m.type, key: m.key, src: 'admin', data: n });
+      const ck = isPax ? 'pax-chg|pc:' + d.id : 'drv-chg|xc:' + d.id, cp = stickyData(rm, ck);
+      if (!cp || cp.status !== 'pendiente') pushMessage(rm, { type: isPax ? 'pax-chg' : 'drv-chg', key: (isPax ? 'pc:' : 'xc:') + d.id, src: 'admin', data: Object.assign({ id: d.id, rid: 'sync' + Date.now().toString(36), status: 'aprobado', sync: 1, at: Date.now() }, v) });
+    }
+  } catch (e) { console.warn('crossRoleSync', e.message); }
+}
 app.post('/api/admin/paxchg', (req, res) => {
   const b = req.body || {};
   if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -1518,6 +1537,7 @@ app.post('/api/admin/paxchg', (req, res) => {
     const n = Object.assign({}, cur);
     ['name', 'dni', 'email', 'emName', 'emPhone', 'dniImg', 'photo'].forEach((k) => { if (pend[k] !== undefined && pend[k] !== null && String(pend[k]) !== '') n[k] = pend[k]; });
     n.upd = Date.now(); pushMessage(rm, { type: 'pax-reg', key: 'pr:' + id, src: 'admin', data: n });
+    crossRoleSync(rm, 'pax', n.phone, { name: pend.name, dni: pend.dni, email: pend.email });
   }
   const saved = pushMessage(rm, { type: 'pax-chg', key: 'pc:' + id, src: 'admin', data });
   res.json({ ok: true, data, id: saved && saved.id });
@@ -1539,6 +1559,7 @@ app.post('/api/admin/drvchg', async (req, res) => {
       const item = { img, at: Date.now() }; docMem.set(id + '|' + kind, item); await kvSet('doc', id + '|' + kind, item); n.docs = Object.assign({}, n.docs, { [kind]: true }); }
     n.updatedAt = Date.now(); n.chgAt = Date.now();
     pushMessage(rm, { type: 'driver-reg', key: 'dr:' + id, src: 'admin', data: n });
+    crossRoleSync(rm, 'drv', n.phone, { name: pend.name, dni: pend.dni, email: pend.email });
   }
   const data = { id, rid: String(pend.rid || '').slice(0, 40), status, reason: String(b.reason || '').slice(0, 200), at: Date.now() };
   if (status === 'aprobado') Object.assign(data, { name: pend.name, dni: pend.dni, plate: pend.plate, vehicle: pend.vehicle, email: pend.email, imgs: pend.imgs });   /* el celular del conductor guarda lo aprobado */
