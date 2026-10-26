@@ -2101,7 +2101,7 @@ function pushNotify(uid, note, acc) {
   if (note && note.skip) return 0; pushVapidEnsure(); if (!uid || !pushPriv) return 0; let n = 0;
   for (const [h, sub] of pushSubs) {
     if (!subUids(sub).includes(String(uid))) continue;
-    const q = pushQueue.get(h) || []; q.push({ title: String(note.title || 'MOBI').slice(0, 80), body: String(note.body || '').slice(0, 200), url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
+    const q = pushQueue.get(h) || []; q.push({ id: crypto.randomBytes(8).toString('hex'), title: String(note.title || 'MOBI').slice(0, 80), body: String(note.body || '').slice(0, 200), url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
     const pr = sub.native ? Promise.resolve({ ok: true, status: 202 }) : pushTouch(h, sub); if (acc) acc.push(pr); n++;   /* V577 · la app de Android lo busca sola */
   }
   return n;
@@ -2300,9 +2300,22 @@ app.post('/api/push/native-poll', (req, res) => {
   const h = 'nat:' + crypto.createHash('sha256').update('mobi-nat|' + dev).digest('hex').slice(0, 36), x = pushSubs.get(h);
   if (!x) return res.json({ ok: true, on: true, msgs: [], reg: false });
   if (!au.sk || x.skh !== au.sk) return res.status(403).json({ ok: false });
-  const now = Date.now(), q = (pushQueue.get(h) || []).filter((m) => now - m.at < 86400_000); pushQueue.delete(h);
+  const now = Date.now(), q = (pushQueue.get(h) || []).filter((m) => now - m.at < 86400_000);
+  pushQueue.set(h, q);   /* V577 · el aviso queda en espera hasta que la app lo muestra (native-ack) */
   if (now - Number(x.seen || 0) > 6 * 3600_000) { x.seen = now; kvSet('push', h, x); } else x.seen = now;
-  res.json({ ok: true, on: true, msgs: q.map((m) => ({ title: m.title, body: m.body })) });
+  res.json({ ok: true, on: true, msgs: q.map((m) => ({ id: m.id || '', title: m.title, body: m.body })) });
+});
+/* V577 · la app confirma los avisos que ya mostró (los saca de la espera) */
+app.post('/api/push/native-ack', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const b = req.body || {}, room = getRoom(b.room), au = authOf(req, room.name), dev = String(b.dev || '');
+  if (!NAT_RE.test(dev)) return res.status(400).json({ ok: false });
+  const h = 'nat:' + crypto.createHash('sha256').update('mobi-nat|' + dev).digest('hex').slice(0, 36), x = pushSubs.get(h);
+  if (!x) return res.json({ ok: true });
+  if (!au.sk || x.skh !== au.sk) return res.status(403).json({ ok: false });
+  const ids = new Set((Array.isArray(b.ids) ? b.ids : []).map((v) => String(v || '').slice(0, 40)).slice(0, 20));
+  pushQueue.set(h, (pushQueue.get(h) || []).filter((m) => !ids.has(String(m.id || ''))));
+  res.json({ ok: true });
 });
 app.post('/api/admin/natpush', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
