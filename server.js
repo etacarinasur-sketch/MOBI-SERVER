@@ -103,6 +103,7 @@ async function dbInit() {
     try { const dl = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'dl' AND id = 'counts'`); if (dl.rows[0] && dl.rows[0].data) for (const k of DL_KINDS) { const o = dl.rows[0].data[k]; if (o) { dlStat[k].t = Number(o.t) || 0; dlStat[k].d = o.d || {}; } } } catch (e) { console.warn('dl', e.message); }
     try { const at = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'admtok'`); for (const row of at.rows) if (row.data && row.data.t && Number(row.data.exp) > Date.now()) adminTokens.set(String(row.data.t), Number(row.data.exp)); db.query(`DELETE FROM mobi_kv WHERE ns = 'admtok' AND at < now() - interval '13 hours'`).catch(() => {}); } catch (e) { console.warn('admtok', e.message); }
     try { const tp = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'tpax' AND at > now() - interval '120 days'`); for (const row of tp.rows) if (row.data && row.data.h && !tripPax.has(row.id)) tripPax.set(row.id, row.data.h); } catch (e) { console.warn('tpax', e.message); }
+    try { const wl = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wel'`); for (const row of wl.rows) { const d = row.data; if (d && d.tk && !d.gone && (d.done || Date.now() - Number(d.at || 0) < WEL_HOLD_MS)) welRec.set(row.id, d); } } catch (e) { console.warn('wel', e.message); }   /* V576 */
     try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h && !ownMap.has(row.id)) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
@@ -129,7 +130,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg']);   /* V558 · MOBI Flex (vendedores) */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -226,7 +227,8 @@ function pushMessage(room, m) {
   } else if ((msg.type === 'driver-pos' || msg.type === 'pax-pos' || msg.type === 'pay-proof' || msg.type === 'pay-proof-meta') && msg.data && msg.data.tripKey) { msg.tk = String(msg.data.tripKey); msg.priv = 'pos'; }
   else if (msg.type === 'chat' && msg.data && msg.data.tk) { msg.tk = String(msg.data.tk); msg.priv = 'pos'; if (!msg.key && msg.data.m && msg.data.m.id) msg.key = 'ch:' + String(msg.data.m.id).slice(0, 60); }   /* V469 · comprobantes y chat: solo a los dos del viaje (y al administrador) */
   if (msg.type === 'drv-pres' && msg.data && msg.data.id && msg.data.online !== false) { if (!room.seen) room.seen = new Map(); room.seen.set(String(msg.data.id), Date.now()); }   /* V473 · última vez conectado (para el cupo) */
-  try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}   /* V485 · historial de conductores (viajes y conexiones) */
+  try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}
+  try { if ((msg.type === 'trip-done' || msg.type === 'trip-end') && welRec.size) welIngest(room, msg); } catch (e) {}   /* V576 · viajes de bienvenida */   /* V485 · historial de conductores (viajes y conexiones) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
   if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
   /* V571 · el administrador aprobó o rechazó un vehículo agregado (moto o auto): aviso al celular del conductor aunque tenga la app cerrada */
@@ -630,7 +632,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -651,7 +653,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -2255,6 +2257,96 @@ app.post('/api/admin/push-zone', async (req, res) => {
   const acc = []; let n = 0; for (const id of reach) if (pushNotify(id, { title, body }, acc)) n++;
   const rs = await Promise.all(acc); console.log('Aviso por zona', role, prov || 'todas', zone || '', '→', n);
   res.json({ ok: true, people: ids.size, sent: n, accepted: rs.filter((x) => x.ok).length, codes: rs.map((x) => x.status) });
+});
+
+/* ===================== V576 · VIAJES DE BIENVENIDA =====================
+   Los activa el administrador (apagado = la app funciona exactamente igual que antes).
+   Pasajero: 3 viajes gratis por persona (DNI y celular), de hasta 3 km, directos, 1 por día, dentro de los 30 días desde el primero.
+   Solo para quien todavía no hizo ningún viaje. Cuenta recién cuando el viaje TERMINA (si se cancela, no se pierde). */
+const WEL_MAX = 3, WEL_KM = 3, WEL_DAYS = 30, WEL_HOLD_MS = 3 * 3600_000;
+const welRec = new Map();   // 'sala|tripKey' -> { tk, pax, keys, at, val, km, vk, end, done, drv, self }
+function welCfg(room) { const m = room.sticky.get('cfg-welcome|cfg:welcome'), d = m && m.data; return { on: !!(d && d.on), cap: Math.max(0, Math.round(Number(d && d.cap) || 0)), at: Number(d && d.at) || 0 }; }
+function welDay(t) { return new Date(Number(t) - 3 * 3600_000).toISOString().slice(0, 10); }   /* día en Argentina */
+function welHash(v) { return crypto.createHash('sha256').update('mobi-wel|' + v).digest('hex').slice(0, 24); }
+function welKeys(reg) { const k = [], dni = String((reg && reg.dni) || '').replace(/\D/g, ''), ph = tail8(reg && reg.phone); if (dni.length >= 6) k.push('d' + welHash(dni)); if (ph.length >= 8) k.push('p' + welHash(ph)); return k; }
+function welSave(k, r) { kvSet('wel', k, r || { gone: 1 }); }
+function welOf(room) { const p = room.name + '|', out = []; for (const [k, r] of welRec) if (k.startsWith(p) && r) out.push(r); return out; }
+function welLive(r, now) { return !r.done && !r.end && now - Number(r.at || 0) < WEL_HOLD_MS; }
+function welPaidBefore(room, paxId, until, skip) {   /* ¿ya hizo algún viaje normal? */
+  for (const m of room.sticky.values()) {
+    if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist) || Number(m.at || 0) >= until) continue;
+    if (skip.has(String(m.data.tripKey || ''))) continue;
+    if (m.data.hist.some((h) => h && h.item && String(h.item.paxId || '') === paxId)) return true;
+  }
+  return false;
+}
+function welStatus(room, paxId) {
+  const c = welCfg(room), now = Date.now(), out = { ok: true, on: c.on, max: WEL_MAX, km: WEL_KM, days: WEL_DAYS, used: 0, left: 0 };
+  if (!c.on) return Object.assign(out, { can: false, why: 'off' });
+  const reg = stickyData(room, 'pax-reg|pr:' + paxId), keys = welKeys(reg);
+  if (!reg || reg.deletedAt || !keys.length) return Object.assign(out, { can: false, why: 'noreg' });
+  const all = welOf(room), mine = all.filter((r) => r.done && (r.keys || []).some((x) => keys.includes(x))).sort((a, b) => a.done - b.done);
+  const live = all.filter((r) => welLive(r, now) && (r.keys || []).some((x) => keys.includes(x)));
+  const first = mine.length ? mine[0].done : 0;
+  Object.assign(out, { used: mine.length, left: Math.max(0, WEL_MAX - mine.length), first, until: first ? first + WEL_DAYS * 86400_000 : 0 });
+  if (mine.length >= WEL_MAX) return Object.assign(out, { can: false, why: 'used' });
+  if (first && now > out.until) return Object.assign(out, { can: false, why: 'expired' });
+  if (mine.some((r) => welDay(r.done) === welDay(now))) return Object.assign(out, { can: false, why: 'today' });
+  if (welPaidBefore(room, paxId, first || now, new Set(mine.map((r) => r.tk)))) return Object.assign(out, { can: false, why: 'traveled' });
+  if (c.cap && !live.length) { const d = welDay(now); const n = all.filter((r) => (r.done && welDay(r.done) === d) || (welLive(r, now) && welDay(r.at) === d)).length; if (n >= c.cap) return Object.assign(out, { can: false, why: 'cap' }); }
+  if (live.length) out.hold = live[0].tk;
+  return Object.assign(out, { can: true });
+}
+function welIngest(room, msg) {
+  const d = msg.data; if (!d || !d.tripKey) return;
+  const k = room.name + '|' + String(d.tripKey), r = welRec.get(k); if (!r || r.done) return;
+  if (msg.type === 'trip-end') { if (!r.end) { r.end = Date.now(); welSave(k, r); } return; }   /* cancelado: no cuenta (si después llega «terminado», cuenta) */
+  const hd = Array.isArray(d.hist) ? ((d.hist.find((h) => h && h.role === 'drv') || {}).item || {}) : {}, cl = room.claims && room.claims.get(String(d.tripKey));
+  r.drv = String(hd.driverId || (cl && cl.driverId) || '');
+  const dk = welKeys(stickyData(room, 'driver-reg|dr:' + r.drv)); r.self = dk.some((x) => (r.keys || []).includes(x));   /* el conductor se llevó a sí mismo: no suma saldo */
+  r.done = Date.now(); welSave(k, r);
+  console.log('Viaje de bienvenida terminado', d.tripKey, '$' + r.val, r.self ? '(mismo dueño: sin saldo)' : '');
+}
+function welPax(req, res) {
+  const b = req.body || {}, room = getRoom(b.room), id = String(b.paxId || ''), au = authOf(req, room.name);
+  if (!OWN_RE.pax.test(id)) { res.status(400).json({ ok: false, error: 'pax' }); return null; }
+  if (!au.admin && !isOwner(room, 'pax', id, au.sk, legacyBind(room, 'pax', id))) { res.status(403).json({ ok: false, error: 'owner' }); return null; }
+  return { room, id };
+}
+app.post('/api/welcome/status', (req, res) => { res.setHeader('Cache-Control', 'no-store'); const x = welPax(req, res); if (x) res.json(welStatus(x.room, x.id)); });
+app.post('/api/welcome/hold', (req, res) => {
+  const x = welPax(req, res); if (!x) return; const b = req.body || {}, tk = String(b.tripKey || '');
+  if (!/^[A-Za-z0-9]{6,30}$/.test(tk)) return res.status(400).json({ ok: false, error: 'trip' });
+  const k = x.room.name + '|' + tk, prev = welRec.get(k); if (prev) return res.json({ ok: true, hold: tk, done: !!prev.done });
+  const km = Number(b.km), val = Math.round(Number(b.value) || 0);
+  if (!(km > 0 && km <= WEL_KM + 0.05) || !(val > 0 && val <= 50000)) return res.json({ ok: false, why: 'km' });
+  const st = welStatus(x.room, x.id); if (!st.can) return res.json({ ok: false, why: st.why });
+  if (st.hold && st.hold !== tk) { const ok = x.room.name + '|' + st.hold, o = welRec.get(ok); if (o) { o.end = Date.now(); welSave(ok, o); } }   /* un pedido anterior que quedó colgado */
+  const r = { tk, pax: x.id, keys: welKeys(stickyData(x.room, 'pax-reg|pr:' + x.id)), at: Date.now(), val, km: Math.round(km * 100) / 100, vk: b.vkind === 'moto' ? 'moto' : 'auto', end: 0, done: 0 };
+  welRec.set(k, r); welSave(k, r); res.json({ ok: true, hold: tk });
+});
+app.post('/api/admin/welcome', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), prev = welCfg(room);
+  const data = { on: b.on === undefined ? prev.on : !!b.on, cap: b.cap === undefined ? prev.cap : Math.max(0, Math.min(10000, Math.round(Number(b.cap) || 0))), at: Date.now() };
+  pushMessage(room, { type: 'cfg-welcome', key: 'cfg:welcome', src: 'admin', data });
+  console.log('Viajes de bienvenida', data.on ? 'ACTIVADOS' : 'desactivados', 'tope diario', data.cap || 'sin tope');
+  res.json(Object.assign({ ok: true }, data));
+});
+app.post('/api/admin/welcome-info', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), now = Date.now(), day = welDay(now), all = welOf(room), done = all.filter((r) => r.done);
+  const sum = (l) => l.reduce((a, r) => a + (r.self ? 0 : Number(r.val) || 0), 0), td = done.filter((r) => welDay(r.done) === day);
+  const zones = {}, seen = room.seen || new Map();
+  for (const [k, m] of room.sticky) {
+    const d = m && m.data; if (!d || m.type !== 'driver-reg' || !k.startsWith('driver-reg|dr:') || d.status !== 'aprobado' || d.deletedAt || drvHidden(d)) continue;
+    const z = (String(d.prov || '').trim() || 'Sin provincia') + ' · ' + (String(d.zone || '').trim() || 'sin zona'), o = zones[z] || (zones[z] = { zone: z, auto: 0, moto: 0, online: 0 });
+    if (String(d.vtype || '') === 'moto') o.moto++; else o.auto++;
+    if (now - Number(seen.get(String(d.id)) || 0) < 3 * 60_000) o.online++;
+  }
+  const nm = (t, id) => { const x = stickyData(room, t + id); return (x && x.name) || ''; };
+  const recent = done.sort((a, b) => b.done - a.done).slice(0, 15).map((r) => ({ at: r.done, val: r.val, km: r.km, vk: r.vk, self: !!r.self, pax: nm('pax-reg|pr:', r.pax), drv: nm('driver-reg|dr:', r.drv) }));
+  res.json({ ok: true, cfg: welCfg(room), today: { n: td.length, val: sum(td) }, total: { n: done.length, val: sum(done), pax: new Set(done.map((r) => r.pax)).size }, live: all.filter((r) => welLive(r, now)).length, zones: Object.values(zones).sort((x, y) => (y.auto + y.moto) - (x.auto + x.moto)), recent });
 });
 
 app.post('/api/addr/find', (req, res) => {
