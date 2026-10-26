@@ -131,7 +131,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -639,7 +639,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -660,7 +660,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -2102,7 +2102,7 @@ function pushNotify(uid, note, acc) {
   for (const [h, sub] of pushSubs) {
     if (!subUids(sub).includes(String(uid))) continue;
     const q = pushQueue.get(h) || []; q.push({ title: String(note.title || 'MOBI').slice(0, 80), body: String(note.body || '').slice(0, 200), url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
-    const pr = pushTouch(h, sub); if (acc) acc.push(pr); n++;
+    const pr = sub.native ? Promise.resolve({ ok: true, status: 202 }) : pushTouch(h, sub); if (acc) acc.push(pr); n++;   /* V577 · la app de Android lo busca sola */
   }
   return n;
 }
@@ -2265,6 +2265,54 @@ app.post('/api/admin/push-zone', async (req, res) => {
   const rs = await Promise.all(acc); console.log('Aviso por zona', role, prov || 'todas', zone || '', '→', n);
   res.json({ ok: true, people: ids.size, sent: n, accepted: rs.filter((x) => x.ok).length, codes: rs.map((x) => x.status) });
 });
+
+/* ===================== V577 · AVISOS CON LA APP DE ANDROID CERRADA =====================
+   La app de Android no puede usar los avisos del navegador. Con el interruptor encendido, cada celular con la app nueva
+   se anota acá y pregunta solo cada ~15 minutos si tiene avisos (aunque la app esté cerrada). Se guarda como una suscripción
+   más («nat:…»), así todos los avisos existentes (zona, recordatorios, aprobación…) le llegan igual que al navegador.
+   Apagado (de fábrica): no se anota ningún celular y todo funciona igual que antes. */
+function natCfg(room) { const m = room.sticky.get('cfg-natpush|cfg:natpush'), d = m && m.data; return { on: !!(d && d.on), at: Number(d && d.at) || 0 }; }
+const NAT_RE = /^[a-f0-9]{32}$/;
+function natDrop(roomName) {
+  for (const [h, x] of pushSubs) if (x && x.native && (!roomName || (x.room || 'pilot') === roomName)) { pushSubs.delete(h); pushQueue.delete(h); if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]).catch(() => {}); }
+}
+app.post('/api/push/native-reg', (req, res) => {
+  const b = req.body || {}, room = getRoom(b.room), au = authOf(req, room.name), dev = String(b.dev || '');
+  if (!natCfg(room).on) return res.json({ ok: true, on: false });
+  if (!NAT_RE.test(dev) || !au.sk) return res.status(400).json({ ok: false });
+  const ip = String(req.ip || ''), now = Date.now(), rt = pushRate.get(ip) || { n: 0, t: now };
+  if (now - rt.t > 3600_000) { rt.n = 0; rt.t = now; } if (++rt.n > 30) return res.status(429).json({ ok: false }); pushRate.set(ip, rt);
+  if (pushSubs.size > 20000) return res.status(503).json({ ok: false });
+  const kindOf = (u) => (OWN_RE.drv.test(u) ? 'drv' : (OWN_RE.pax.test(u) ? 'pax' : ''));
+  const uids = [...new Set([b.uid].concat(Array.isArray(b.uids) ? b.uids : []).map((u) => String(u || '').slice(0, 60)))]
+    .filter((u) => { const k = kindOf(u); return k && (!ownGet(room, k, u) || ownHas(room, k, u, au.sk)); }).slice(0, 4);
+  if (!uids.length) return res.status(403).json({ ok: false });
+  const h = 'nat:' + crypto.createHash('sha256').update('mobi-nat|' + dev).digest('hex').slice(0, 36), old = pushSubs.get(h);
+  if (old && old.skh && old.skh !== au.sk) return res.status(403).json({ ok: false });
+  const item = { endpoint: h, native: 1, uid: uids[0], uids, room: room.name, skh: au.sk, at: now, seen: now };
+  pushSubs.set(h, item); kvSet('push', h, item); res.json({ ok: true, on: true });
+});
+app.post('/api/push/native-poll', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const b = req.body || {}, room = getRoom(b.room), au = authOf(req, room.name), dev = String(b.dev || '');
+  if (!natCfg(room).on) return res.json({ ok: true, on: false, msgs: [] });
+  if (!NAT_RE.test(dev)) return res.status(400).json({ ok: false });
+  const h = 'nat:' + crypto.createHash('sha256').update('mobi-nat|' + dev).digest('hex').slice(0, 36), x = pushSubs.get(h);
+  if (!x) return res.json({ ok: true, on: true, msgs: [], reg: false });
+  if (!au.sk || x.skh !== au.sk) return res.status(403).json({ ok: false });
+  const now = Date.now(), q = (pushQueue.get(h) || []).filter((m) => now - m.at < 86400_000); pushQueue.delete(h);
+  if (now - Number(x.seen || 0) > 6 * 3600_000) { x.seen = now; kvSet('push', h, x); } else x.seen = now;
+  res.json({ ok: true, on: true, msgs: q.map((m) => ({ title: m.title, body: m.body })) });
+});
+app.post('/api/admin/natpush', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room);
+  if (b.on !== undefined) { pushMessage(room, { type: 'cfg-natpush', key: 'cfg:natpush', src: 'admin', data: { on: !!b.on, at: Date.now() } }); if (!b.on) natDrop(room.name); }
+  const nat = [...pushSubs.values()].filter((x) => x && x.native && (x.room || 'pilot') === room.name), now = Date.now();
+  res.json({ ok: true, cfg: natCfg(room), phones: nat.length, active: nat.filter((x) => now - Number(x.seen || 0) < 24 * 3600_000).length });
+});
+/* celulares con la app que no preguntan hace 10 días (desinstalada): se olvidan */
+setInterval(() => { const now = Date.now(); for (const [h, x] of pushSubs) if (x && x.native && now - Number(x.seen || x.at || 0) > 10 * 86400_000) { pushSubs.delete(h); pushQueue.delete(h); if (db) db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]).catch(() => {}); } }, 3600_000).unref();
 
 /* ===================== V576 · VIAJES DE BIENVENIDA =====================
    Los activa el administrador (apagado = la app funciona exactamente igual que antes).
