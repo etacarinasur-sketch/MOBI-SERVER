@@ -347,7 +347,7 @@ function ledgerOf(room, drv) {
       if (y.type === 'charge') L.charges += a;
       else if (y.type === 'credit') {
         if (y.hold || y.ver === false) { L.held += a; continue; }
-        L.cred += a; if (isCancelCredit(y)) L.cancelCr += a;
+        L.cred += a; if (isCancelCredit(y) || y.kind === 'welcome') L.cancelCr += a;   /* V576 · saldo de viajes de bienvenida: descuenta deuda/comisiones, no se retira */
         /* V525 · cobro con tarjeta: Mercado Pago entrega la plata a los MP_RELEASE_DAYS días; hasta entonces suma al saldo pero no se puede retirar */
         if (MP_RELEASE_DAYS > 0 && isCardCredit(y)) { const mo = y.mpOrd && mpOrders.get(String(y.mpOrd)), t0 = Number((mo && mo.at) || y.paidAt || y.at || 0), rel = t0 + MP_RELEASE_DAYS * 86400_000;
           if (rel > now) { L.unrel += a; if (!L.nextRel || rel < L.nextRel) L.nextRel = rel; } }
@@ -475,7 +475,8 @@ function guardMsg(room, m, auth) {
     const tr = stickyData(room, 'trip|tr:' + k + ':drv'), cl = room.claims.get(k);
     const who = String((tr && tr.active && tr.active.driver && tr.active.driver.id) || (cl && cl.driverId) || '');
     if (who !== drv) { console.log('Saldo a favor rechazado: el viaje no es de este conductor', drv, who || '-', k); return null; }
-    const kind = String(d.kind || ''), o = Object.assign({}, d); delete o.ver; delete o.hold; delete o.holdWhy; delete o.paxIdent; delete o.paxSk; delete o.releasedAt; o.at = Date.now();
+    const kind = String(d.kind || ''), o = Object.assign({}, d); if (kind === 'welcome') return null;   /* V576 · ese saldo lo pone solo el servidor */
+    delete o.ver; delete o.hold; delete o.holdWhy; delete o.paxIdent; delete o.paxSk; delete o.releasedAt; o.at = Date.now();
     let n = 0, nc = 0; for (const x of room.sticky.values()) if (x && x.type === 'debt-charge' && x.data && x.data.type === 'credit' && String(x.data.tripKey || '') === k) { n++; if (isCancelCredit(x.data)) nc++; }
     if (n >= 3) return null;
     if (isCancelCredit(o)) {   /* V510 · cancelación: queda retenida hasta que MOBI le cobre el cargo al pasajero */
@@ -2306,6 +2307,10 @@ function welIngest(room, msg) {
   const dk = welKeys(stickyData(room, 'driver-reg|dr:' + r.drv)); r.self = dk.some((x) => (r.keys || []).includes(x));   /* el conductor se llevó a sí mismo: no suma saldo */
   r.done = Date.now(); welSave(k, r);
   console.log('Viaje de bienvenida terminado', d.tripKey, '$' + r.val, r.self ? '(mismo dueño: sin saldo)' : '');
+  /* saldo a favor del conductor por el valor del viaje (sin recargos). Nunca vence y no se retira: descuenta lo que deba (comisiones, cancelaciones u otros cargos) */
+  if (!r.self && OWN_RE.drv.test(r.drv) && r.val > 0 && !room.sticky.has('debt-charge|dc:wel:' + r.tk)) {
+    pushMessage(room, { type: 'debt-charge', key: 'dc:wel:' + r.tk, src: 'admin', data: { id: 'wel_' + String(r.tk).slice(0, 40), type: 'credit', kind: 'welcome', amount: r.val, at: Date.now(), driver: r.drv, note: '🎁 Viaje de bienvenida · saldo a favor', route: String(hd.route || '').slice(0, 200), tripKey: r.tk, srv: 1 } });
+  }
 }
 function welPax(req, res) {
   const b = req.body || {}, room = getRoom(b.room), id = String(b.paxId || ''), au = authOf(req, room.name);
