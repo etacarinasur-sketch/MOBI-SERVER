@@ -104,6 +104,7 @@ async function dbInit() {
     try { const at = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'admtok'`); for (const row of at.rows) if (row.data && row.data.t && Number(row.data.exp) > Date.now()) adminTokens.set(String(row.data.t), Number(row.data.exp)); db.query(`DELETE FROM mobi_kv WHERE ns = 'admtok' AND at < now() - interval '13 hours'`).catch(() => {}); } catch (e) { console.warn('admtok', e.message); }
     try { const tp = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'tpax' AND at > now() - interval '120 days'`); for (const row of tp.rows) if (row.data && row.data.h && !tripPax.has(row.id)) tripPax.set(row.id, row.data.h); } catch (e) { console.warn('tpax', e.message); }
     try { const wl = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wel'`); for (const row of wl.rows) { const d = row.data; if (d && d.tk && !d.gone && (d.done || Date.now() - Number(d.at || 0) < WEL_HOLD_MS)) welRec.set(row.id, d); } } catch (e) { console.warn('wel', e.message); }   /* V576 */
+    try { const rr = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'remind'`); for (const row of rr.rows) if (row.data) remMem.set(row.id, row.data); } catch (e) { console.warn('remind', e.message); }   /* V576 */
     try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h && !ownMap.has(row.id)) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
@@ -130,7 +131,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -231,6 +232,11 @@ function pushMessage(room, m) {
   try { if ((msg.type === 'trip-done' || msg.type === 'trip-end') && welRec.size) welIngest(room, msg); } catch (e) {}   /* V576 · viajes de bienvenida */   /* V485 · historial de conductores (viajes y conexiones) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
   if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
+  /* V576 · el administrador aprobó o rechazó la cuenta del conductor: aviso con la app cerrada, con su mensaje */
+  try { if (msg.type === 'driver-reg' && msg.key && msg.data) {   /* solo el administrador puede pasar una cuenta a aprobada o rechazada */
+    const pv0 = room.sticky.get('driver-reg|' + msg.key), ps = String((pv0 && pv0.data && pv0.data.status) || ''), ns = String(msg.data.status || '');
+    if (ps !== ns && (ns === 'aprobado' || ns === 'rechazado')) { const why = String(msg.data.reason || '').trim().slice(0, 180);
+      pushNotify(String(msg.data.id || ''), ns === 'aprobado' ? { title: '✅ ¡Tu cuenta de conductor fue aprobada!', body: why || 'Ya podés trabajar con MOBI. Conectate para recibir viajes.' } : { title: 'Tu documentación necesita un cambio', body: why || 'Revisá tus documentos en Configuración y volvé a enviarlos.' }); } } } catch (e) {}
   /* V571 · el administrador aprobó o rechazó un vehículo agregado (moto o auto): aviso al celular del conductor aunque tenga la app cerrada */
   try { if (msg.type === 'driver-reg' && msg.key && msg.data && Array.isArray(msg.data.cars)) {
     const pv = room.sticky.get('driver-reg|' + msg.key), pc = (pv && pv.data && Array.isArray(pv.data.cars)) ? pv.data.cars : null;
@@ -633,7 +639,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -654,7 +660,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -2352,6 +2358,71 @@ app.post('/api/admin/welcome-info', (req, res) => {
   const nm = (t, id) => { const x = stickyData(room, t + id); return (x && x.name) || ''; };
   const recent = done.sort((a, b) => b.done - a.done).slice(0, 15).map((r) => ({ at: r.done, val: r.val, km: r.km, vk: r.vk, self: !!r.self, pax: nm('pax-reg|pr:', r.pax), drv: nm('driver-reg|dr:', r.drv) }));
   res.json({ ok: true, cfg: welCfg(room), today: { n: td.length, val: sum(td) }, total: { n: done.length, val: sum(done), pax: new Set(done.map((r) => r.pax)).size }, live: all.filter((r) => welLive(r, now)).length, zones: Object.values(zones).sort((x, y) => (y.auto + y.moto) - (x.auto + x.moto)), recent });
+});
+
+/* ===================== V576 · RECORDATORIO A CONDUCTORES «SIN ENVIAR» =====================
+   Conductores que empezaron el registro pero no tocaron «Enviar a evaluación»: un aviso al celular (con la app cerrada)
+   cada 4 horas diciendo qué les falta, hasta que lo envíen. No se manda de noche (22 a 9). Lo prende el administrador. */
+const REM_EVERY = 4 * 3600_000, remMem = new Map();   // 'sala|drv' -> { n, last }
+function remCfg(room) { const m = room.sticky.get('cfg-remind|cfg:remind'), d = m && m.data; return { on: !!(d && d.on), at: Number(d && d.at) || 0 }; }
+function remHourAR(t) { return new Date(Number(t) - 3 * 3600_000).getUTCHours(); }
+function remDrafts(room) {
+  const out = [];
+  for (const [k, m] of room.sticky) {
+    const d = m && m.data; if (!d || m.type !== 'driver-reg' || !k.startsWith('driver-reg|dr:') || !OWN_RE.drv.test(String(d.id || ''))) continue;
+    const st = String(d.status || 'borrador'); if (st !== 'borrador' || d.deletedAt || d.hiddenAt) continue;
+    const nm = String(d.name || '').trim(), real = nm && !/^(Conductor|Conductor MOBI|Tu conductor)$/i.test(nm), dc = d.docs || {};
+    if (!real && !String(d.plate || '').replace(/[—\-\s]/g, '') && !Object.keys(dc).some((x) => dc[x])) continue;   /* abrió el modo conductor sin cargar nada: no se lo molesta */
+    out.push(d);
+  }
+  return out;
+}
+function remMissing(d) {
+  const f = [], dc = d.docs || {};
+  if (!String(d.name || '').trim() || /^(Conductor|Conductor MOBI|Tu conductor)$/i.test(String(d.name || '').trim())) f.push('tu nombre');
+  if (tail8(d.phone).length < 8) f.push('tu celular');
+  if (String(d.dni || '').replace(/\D/g, '').length < 6) f.push('tu DNI');
+  if (!dc.cedula) f.push('la foto de la cédula');
+  if (!dc.license) f.push('la foto del registro');
+  return f;
+}
+function remNote(d) {
+  const f = remMissing(d), list = f.length > 1 ? f.slice(0, -1).join(', ') + ' y ' + f[f.length - 1] : (f[0] || '');
+  return { title: '🚗 Terminá tu registro en MOBI', body: f.length ? 'Te falta ' + list + '. Completalo en Conductor → Configuración y tocá «Enviar a evaluación».' : 'Ya cargaste todo: solo te falta tocar «Enviar a evaluación» en Conductor → Configuración.' };
+}
+function remSend(room, d) {
+  const id = String(d.id), k = room.name + '|' + id, n = pushNotify(id, remNote(d));
+  const r = remMem.get(k) || { n: 0, last: 0 }; r.last = Date.now(); if (n) r.n++; remMem.set(k, r); kvSet('remind', k, r);
+  return n;
+}
+function remTick() {
+  const now = Date.now(), h = remHourAR(now); if (h < 9 || h >= 22 || !pushLoaded) return;
+  for (const room of rooms.values()) {
+    if (/^sandbox/.test(room.name) || !remCfg(room).on) continue;
+    for (const d of remDrafts(room)) {
+      const k = room.name + '|' + String(d.id), r = remMem.get(k);
+      if (r && now - Number(r.last || 0) < REM_EVERY) continue;
+      if (now - Number(d.updatedAt || 0) < 3600_000) continue;   /* lo está completando ahora: no se lo interrumpe */
+      if (![...pushSubs.values()].some((x) => (x.room || 'pilot') === room.name && subUids(x).includes(String(d.id)))) continue;
+      remSend(room, d);
+    }
+  }
+}
+setInterval(() => { try { remTick(); } catch (e) {} }, 10 * 60_000).unref();
+app.post('/api/admin/remind', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room);
+  if (b.on !== undefined) pushMessage(room, { type: 'cfg-remind', key: 'cfg:remind', src: 'admin', data: { on: !!b.on, at: Date.now() } });
+  const subs = new Set([...pushSubs.values()].filter((x) => (x.room || 'pilot') === room.name).flatMap((x) => subUids(x)));
+  const list = remDrafts(room).map((d) => { const r = remMem.get(room.name + '|' + String(d.id)) || {}; return { id: d.id, push: subs.has(String(d.id)), n: Number(r.n) || 0, last: Number(r.last) || 0, missing: remMissing(d) }; });
+  res.json({ ok: true, cfg: remCfg(room), drafts: list.length, withPush: list.filter((x) => x.push).length, list });
+});
+app.post('/api/admin/remind-one', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), d = stickyData(room, 'driver-reg|dr:' + String(b.id || ''));
+  if (!d) return res.status(404).json({ ok: false, error: 'no_existe' });
+  if (!pushLoaded) return res.status(503).json({ ok: false });
+  const n = remSend(room, d); res.json({ ok: true, sent: n, note: remNote(d) });
 });
 
 app.post('/api/addr/find', (req, res) => {
