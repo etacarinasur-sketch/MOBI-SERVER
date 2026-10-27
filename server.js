@@ -2271,9 +2271,9 @@ app.post('/api/admin/drvphoto', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const room = getRoom(b.room);
   const m0 = room.sticky.get('cfg-drvphoto|cfg:drvphoto'), d0 = (m0 && m0.data) || {};
-  if (b.on !== undefined || b.vtc !== undefined) pushMessage(room, { type: 'cfg-drvphoto', key: 'cfg:drvphoto', src: 'admin', data: { on: b.on !== undefined ? !!b.on : !!d0.on, vtc: b.vtc !== undefined ? !!b.vtc : !!d0.vtc, at: Date.now() } });   /* V577c · vtc = confirmar auto o moto al enviar */
+  if (b.on !== undefined || b.vtc !== undefined || b.mdl !== undefined) pushMessage(room, { type: 'cfg-drvphoto', key: 'cfg:drvphoto', src: 'admin', data: { on: b.on !== undefined ? !!b.on : !!d0.on, vtc: b.vtc !== undefined ? !!b.vtc : !!d0.vtc, mdl: b.mdl !== undefined ? !!b.mdl : !!d0.mdl, at: Date.now() } });   /* V578b · mdl = controlar «Marca y modelo» */   /* V577c · vtc = confirmar auto o moto al enviar */
   const m = room.sticky.get('cfg-drvphoto|cfg:drvphoto'), d = m && m.data;
-  res.json({ ok: true, on: !!(d && d.on), vtc: !!(d && d.vtc) });
+  res.json({ ok: true, on: !!(d && d.on), vtc: !!(d && d.vtc), mdl: !!(d && d.mdl) });
 });
 
 /* ===================== V577 · AVISOS CON LA APP DE ANDROID CERRADA =====================
