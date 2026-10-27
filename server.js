@@ -2343,7 +2343,9 @@ setInterval(() => { const now = Date.now(); for (const [h, x] of pushSubs) if (x
    Solo para quien todavía no hizo ningún viaje. Cuenta recién cuando el viaje TERMINA (si se cancela, no se pierde). */
 const WEL_MAX = 3, WEL_KM = 3, WEL_DAYS = 30, WEL_HOLD_MS = 3 * 3600_000;
 const welRec = new Map();   // 'sala|tripKey' -> { tk, pax, keys, at, val, km, vk, end, done, drv, self }
-function welCfg(room) { const m = room.sticky.get('cfg-welcome|cfg:welcome'), d = m && m.data; return { on: !!(d && d.on), cap: Math.max(0, Math.round(Number(d && d.cap) || 0)), at: Number(d && d.at) || 0 }; }
+function welCfg(room) { const m = room.sticky.get('cfg-welcome|cfg:welcome'), d = m && m.data; return { on: !!(d && d.on), cap: Math.max(0, Math.round(Number(d && d.cap) || 0)), max: welMaxOf(d), at: Number(d && d.at) || 0 }; }
+/* V577d · cantidad de viajes de bienvenida por pasajero: la elige el administrador (1 a 3). Sin elegir = 3, como antes */
+function welMaxOf(d) { const n = Math.round(Number(d && d.max)); return n >= 1 && n <= WEL_MAX ? n : WEL_MAX; }
 function welDay(t) { return new Date(Number(t) - 3 * 3600_000).toISOString().slice(0, 10); }   /* día en Argentina */
 function welHash(v) { return crypto.createHash('sha256').update('mobi-wel|' + v).digest('hex').slice(0, 24); }
 function welKeys(reg) { const k = [], dni = String((reg && reg.dni) || '').replace(/\D/g, ''), ph = tail8(reg && reg.phone); if (dni.length >= 6) k.push('d' + welHash(dni)); if (ph.length >= 8) k.push('p' + welHash(ph)); return k; }
@@ -2359,15 +2361,15 @@ function welPaidBefore(room, paxId, until, skip) {   /* ¿ya hizo algún viaje n
   return false;
 }
 function welStatus(room, paxId) {
-  const c = welCfg(room), now = Date.now(), out = { ok: true, on: c.on, max: WEL_MAX, km: WEL_KM, days: WEL_DAYS, used: 0, left: 0 };
+  const c = welCfg(room), now = Date.now(), out = { ok: true, on: c.on, max: c.max, km: WEL_KM, days: WEL_DAYS, used: 0, left: 0 };
   if (!c.on) return Object.assign(out, { can: false, why: 'off' });
   const reg = stickyData(room, 'pax-reg|pr:' + paxId), keys = welKeys(reg);
   if (!reg || reg.deletedAt || !keys.length) return Object.assign(out, { can: false, why: 'noreg' });
   const all = welOf(room), mine = all.filter((r) => r.done && (r.keys || []).some((x) => keys.includes(x))).sort((a, b) => a.done - b.done);
   const live = all.filter((r) => welLive(r, now) && (r.keys || []).some((x) => keys.includes(x)));
   const first = mine.length ? mine[0].done : 0;
-  Object.assign(out, { used: mine.length, left: Math.max(0, WEL_MAX - mine.length), first, until: first ? first + WEL_DAYS * 86400_000 : 0 });
-  if (mine.length >= WEL_MAX) return Object.assign(out, { can: false, why: 'used' });
+  Object.assign(out, { used: mine.length, left: Math.max(0, c.max - mine.length), first, until: first ? first + WEL_DAYS * 86400_000 : 0 });
+  if (mine.length >= c.max) return Object.assign(out, { can: false, why: 'used' });
   if (first && now > out.until) return Object.assign(out, { can: false, why: 'expired' });
   if (mine.some((r) => welDay(r.done) === welDay(now))) return Object.assign(out, { can: false, why: 'today' });
   if (welPaidBefore(room, paxId, first || now, new Set(mine.map((r) => r.tk)))) return Object.assign(out, { can: false, why: 'traveled' });
@@ -2410,9 +2412,9 @@ app.post('/api/welcome/hold', (req, res) => {
 app.post('/api/admin/welcome', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
   const room = getRoom(b.room), prev = welCfg(room);
-  const data = { on: b.on === undefined ? prev.on : !!b.on, cap: b.cap === undefined ? prev.cap : Math.max(0, Math.min(10000, Math.round(Number(b.cap) || 0))), at: Date.now() };
+  const data = { on: b.on === undefined ? prev.on : !!b.on, cap: b.cap === undefined ? prev.cap : Math.max(0, Math.min(10000, Math.round(Number(b.cap) || 0))), max: b.max === undefined ? prev.max : welMaxOf({ max: b.max }), at: Date.now() };
   pushMessage(room, { type: 'cfg-welcome', key: 'cfg:welcome', src: 'admin', data });
-  console.log('Viajes de bienvenida', data.on ? 'ACTIVADOS' : 'desactivados', 'tope diario', data.cap || 'sin tope');
+  console.log('Viajes de bienvenida', data.on ? 'ACTIVADOS' : 'desactivados', 'tope diario', data.cap || 'sin tope', 'viajes por pasajero', data.max);
   res.json(Object.assign({ ok: true }, data));
 });
 app.post('/api/admin/welcome-info', (req, res) => {
