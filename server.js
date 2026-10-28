@@ -1448,6 +1448,23 @@ app.post('/api/debt/me', (req, res) => {
   const L = ledgerOf(r, drv);
   res.json({ ok: true, at: Date.now(), debt: L.debt, favor: L.favor, avail: L.avail, held: L.held, unrel: L.unrel, nextRel: L.nextRel, relDays: MP_RELEASE_DAYS, payPend: Math.round(L.payPend * 100) / 100, list: L.list.map((y) => { const o = Object.assign({}, y); delete o.paxIdent; delete o.paxSk; return o; }) });
 });
+/* V596 · totales del administrador calculados por el SERVIDOR (iguales en todos los celulares): volumen de viajes, comisión generada, deuda y pagos de los conductores */
+const finCache = new Map();
+app.post('/api/admin/finance', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), hit = finCache.get(room.name); if (hit && Date.now() - hit.t < 8000) return res.json(hit.d);
+  let vol = 0, fee = 0, trips = 0; const seen = new Set(), drivers = new Set();
+  for (const x of room.sticky.values()) {
+    if (!x) continue;
+    if (x.type === 'trip-done' && x.data && x.data.sum) {
+      const sm = x.data.sum, k = String(x.data.tripKey || sm.tripKey || sm.tripId || ''); if (k) { if (seen.has(k)) continue; seen.add(k); }
+      vol += Number(sm.fare) || 0; fee += Number(sm.fee) || 0; trips++;
+    } else if ((x.type === 'debt-charge' || x.type === 'debt-pay') && x.data && x.data.driver) drivers.add(String(x.data.driver));
+  }
+  let owed = 0, paid = 0; for (const d of drivers) { const L = ledgerOf(room, d); owed += L.debt; paid += L.paid; }
+  const r2 = (n) => Math.round(n * 100) / 100, d = { ok: true, at: Date.now(), vol: r2(vol), fee: r2(fee), trips, owed: r2(owed), paid: r2(paid), drivers: drivers.size };
+  finCache.set(room.name, { t: Date.now(), d }); res.json(d);
+});
 /* V510 · el administrador libera a mano un saldo retenido (por ejemplo, un cobro con tarjeta que no se pudo comprobar solo) */
 app.post('/api/admin/release', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -1610,6 +1627,7 @@ app.post('/api/admin/pricing', (req, res) => {
     ruleOn: c.ruleOn ? 1 : 0, ruleDays: num(c.ruleDays, 0, 127, 96), ruleFrom: num(c.ruleFrom, 0, 23, 21), ruleTo: num(c.ruleTo, 0, 23, 3), rulePct: num(c.rulePct, 0, 100, 15),
     rainOn: c.rainOn ? 1 : 0, rainPct: num(c.rainPct, 0, 100, 10), capPct: num(c.capPct, 0, 100, 60),
     envioOn: c.envioOn === 0 || c.envioOn === false ? 0 : 1, envioPct: num(c.envioPct, 0, 100, 15),
+    motoOn: c.motoOn === 0 || c.motoOn === false ? 0 : 1, motoPct: num(c.motoPct, 0, 90, 30), routeMax: num(c.routeMax, 1, 3, 1.5),   /* V596 · faltaban: el % de la moto volvía siempre a 30 */
     tgtOn: c.tgtOn === 0 || c.tgtOn === false ? 0 : 1, tgtDisc: num(c.tgtDisc, 0, 40, 15), didiBase: num(c.didiBase, 0, 50000, 3000), didiMin: num(c.didiMin, 0, 100000, 3700), didiKm: num(c.didiKm, 0, 5000, 580), didiTierKm: num(c.didiTierKm, 0, 100, 6), didiKm2: num(c.didiKm2, 0, 5000, 170), didiTier2Km: num(c.didiTier2Km, 0, 200, 12), b1On: c.b1On ? 1 : 0, b1Days: num(c.b1Days, 0, 127, 62), b1From: num(c.b1From, 0, 23, 6), b1To: num(c.b1To, 0, 24, 8), b1Pct: num(c.b1Pct, 0, 150, 20), b2On: c.b2On ? 1 : 0, b2Days: num(c.b2Days, 0, 127, 62), b2From: num(c.b2From, 0, 23, 12), b2To: num(c.b2To, 0, 24, 13), b2Pct: num(c.b2Pct, 0, 150, 20), b3On: c.b3On ? 1 : 0, b3Days: num(c.b3Days, 0, 127, 62), b3From: num(c.b3From, 0, 23, 17), b3To: num(c.b3To, 0, 24, 19), b3Pct: num(c.b3Pct, 0, 150, 15), b4On: c.b4On ? 1 : 0, b4Days: num(c.b4Days, 0, 127, 31), b4From: num(c.b4From, 0, 23, 22), b4To: num(c.b4To, 0, 24, 6), b4Pct: num(c.b4Pct, 0, 150, 25), b5On: c.b5On ? 1 : 0, b5Days: num(c.b5Days, 0, 127, 96), b5From: num(c.b5From, 0, 23, 21), b5To: num(c.b5To, 0, 24, 4), b5Pct: num(c.b5Pct, 0, 150, 40), didiKm3: num(c.didiKm3, 0, 10000, 1500), floorPct: num(c.floorPct, 30, 100, 70), at: Date.now()
   };
   const saved = pushMessage(getRoom(b.room), { type: 'cfg-price', key: 'cfg:price', src: 'admin', data });
