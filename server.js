@@ -107,6 +107,7 @@ async function dbInit() {
     try { const rr = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'remind'`); for (const row of rr.rows) if (row.data) remMem.set(row.id, row.data); } catch (e) { console.warn('remind', e.message); }   /* V576 */
     try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h && !ownMap.has(row.id)) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
+    try { const fk = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'fb'`); for (const row of fk.rows) if (row.data && !fbDone.has(row.id)) fbDone.set(row.id, row.data); } catch (e) { console.warn('fb', e.message); }   /* V586 */
     try { const rv = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'revisor' AND id = 'cfg'`); if (rv.rows[0] && rv.rows[0].data) REV = Object.assign(REV, rv.rows[0].data); } catch (e) { console.warn('revisor', e.message); }   /* V584 */
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
     for (const row of w.rows) if (!waVerified.has(row.id)) waVerified.set(row.id, row.data);
@@ -132,7 +133,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-fb']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -164,6 +165,12 @@ setInterval(flushSticky, 1000).unref();
    Encendida, el celular de prueba que cargás en Administración: (1) queda aprobado como conductor al registrarse (con su auto) y
    (2) se verifica "por mail" con un código fijo, sin mandar ningún mail. Cualquier otro celular sigue el camino normal. */
 let REV = { on: false, phone: '', code: '' };
+/* V586 · SEGUINOS EN FACEBOOK (apagado de fábrica). Facebook no deja comprobar quién sigue una página: la persona toca «Ya los seguí» y se confía en ella.
+   Pasajero: con el interruptor encendido, el viaje de bienvenida pide haber tocado «Ya los seguí» (lo decide el servidor).
+   Conductor: solo una invitación (no condiciona nada; los fundadores lo siguen siendo). */
+const fbDone = new Map();   // 'sala|id' -> { at, role }
+function fbCfg(room) { const m = room.sticky.get('cfg-fb|cfg:fb'), d = (m && m.data) || {}; const url = String(d.url || ''); return { on: !!(d.on && url), url, notifiedAt: Number(d.notifiedAt) || 0 }; }
+const fbUrlOk = (u) => { try { const x = new URL(String(u || '')); return x.protocol === 'https:' && /(^|\.)(facebook\.com|fb\.com|fb\.me)$/i.test(x.hostname) && u.length <= 300; } catch (e) { return false; } };
 const revOn = (phone) => !!(REV.on && REV.phone && tail8(REV.phone).length >= 8 && tail8(phone) === tail8(REV.phone));
 async function kvSet(ns, id, data) {
   if (!db) return;
@@ -649,7 +656,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -670,7 +677,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -1711,7 +1718,9 @@ function founderCompute(r) {
   const ids = {}, removed = Object.assign({}, st.removed), first = fFirst(el);
   for (const k of Object.keys(st.ids)) if (ok.has(k) && !removed[k] && k !== first) ids[k] = st.ids[k];   /* los que ya son fundadores se conservan (aunque se baje el cupo) */
   let n = Object.keys(ids).length;
-  if (cfg.auto) for (const x of el) { if (n >= cfg.cap) break; if (x.id === first || ids[x.id] || removed[x.id]) continue; ids[x.id] = now; n++; }
+  let cand = el;   /* V586 · con «Seguinos en Facebook» encendido, los fundadores NUEVOS son los que siguieron la página, en el orden en que lo confirmaron (los que ya eran fundadores se conservan) */
+  if (fbCfg(r).on) cand = el.filter((x) => fbDone.has(r.name + '|' + x.id)).sort((a, b) => (fbDone.get(r.name + '|' + a.id).at || 0) - (fbDone.get(r.name + '|' + b.id).at || 0));
+  if (cfg.auto) for (const x of cand) { if (n >= cfg.cap) break; if (x.id === first || ids[x.id] || removed[x.id]) continue; ids[x.id] = now; n++; }
   founderPublish(r, ids, removed, cfg, el.length, first);
   try {   /* diagnóstico: una línea en el log cada vez que cambia algo */
     const by = {}; for (const m of r.sticky.values()) if (m && m.type === 'driver-reg' && m.data) { const k = m.data.status || '?'; by[k] = (by[k] || 0) + 1; if (k === 'aprobado' && !el.some((x) => x.id === String(m.data.id))) by.aprobado_excluido = (by.aprobado_excluido || 0) + 1; }
@@ -2308,6 +2317,43 @@ app.post('/api/admin/revisor', (req, res) => {
   kvSet('revisor', 'cfg', REV);
   res.json({ ok: true, on: REV.on, phone: REV.phone, code: REV.code });
 });
+function fbOwner(req, res) {
+  const b = req.body || {}, room = getRoom(b.room), role = b.role === 'drv' ? 'drv' : 'pax', id = String(b.id || ''), au = authOf(req, room.name);
+  if (!OWN_RE[role].test(id)) { res.status(400).json({ ok: false, error: 'id' }); return null; }
+  if (!au.admin && !isOwner(room, role, id, au.sk, legacyBind(room, role, id))) { res.status(403).json({ ok: false, error: 'owner' }); return null; }
+  return { room, role, id };
+}
+app.post('/api/fb/status', (req, res) => { res.setHeader('Cache-Control', 'no-store'); const x = fbOwner(req, res); if (!x) return; const c = fbCfg(x.room); res.json({ ok: true, on: c.on, url: c.on ? c.url : '', done: fbDone.has(x.room.name + '|' + x.id) }); });
+app.post('/api/fb/claim', (req, res) => {
+  const x = fbOwner(req, res); if (!x) return; const c = fbCfg(x.room); if (!c.on) return res.json({ ok: false, why: 'off' });
+  const k = x.room.name + '|' + x.id; if (!fbDone.has(k)) { const v = { at: Date.now(), role: x.role }; fbDone.set(k, v); kvSet('fb', k, v); }
+  if (x.role === 'drv') { try { founderCompute(x.room); } catch (e) {} }   /* puede quedar como fundador */
+  res.json({ ok: true, done: true });
+});
+function fbCounts(room) { let pax = 0, drv = 0; for (const [k, v] of fbDone) if (k.startsWith(room.name + '|')) { if (v && v.role === 'drv') drv++; else pax++; } return { pax, drv }; }
+/* aviso a los pasajeros que todavía no siguieron la página y que podrían usar su viaje de bienvenida */
+function fbNotify(room) {
+  if (!welCfg(room).on) return 0; pushVapidEnsure(); if (!pushPriv) return 0; let n = 0;
+  const note = { title: '🎁 Tu viaje de bienvenida', body: 'Para obtener tu viaje gratis solo tenés que seguirnos en Facebook. ¡Disfrutá tu viaje!' };
+  for (const [h, sub] of pushSubs) {
+    if (!sub || sub.room !== room.name) continue; const uid = subUids(sub).find((u) => OWN_RE.pax.test(u)); if (!uid) continue;
+    if (welStatus(room, uid).why !== 'fb') continue;
+    const q = pushQueue.get(h) || []; q.push({ id: crypto.randomBytes(8).toString('hex'), title: note.title, body: note.body, url: './', at: Date.now() }); pushQueue.set(h, q.slice(-5));
+    if (!sub.native) pushTouch(h, sub); n++;
+  }
+  return n;
+}
+app.post('/api/admin/fb', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), m = room.sticky.get('cfg-fb|cfg:fb'), prev = (m && m.data) || {};
+  let url = String(prev.url || ''), on = !!(prev.on && url), notifiedAt = Number(prev.notifiedAt) || 0, sent = 0, changed = false;
+  if (b.url !== undefined) { const u = String(b.url || '').trim(); if (u && !fbUrlOk(u)) return res.status(400).json({ ok: false, error: 'url' }); url = u; if (!url) on = false; changed = true; }
+  if (b.on !== undefined) { if (b.on && !url) return res.status(400).json({ ok: false, error: 'url' }); const was = on; on = !!b.on; changed = true; if (on && !was && !notifiedAt) { notifiedAt = Date.now(); b.__send = 1; } }
+  if (changed) { pushMessage(room, { type: 'cfg-fb', key: 'cfg:fb', src: 'admin', data: { on, url, notifiedAt, at: Date.now() } }); try { founderCompute(room); } catch (e) {} }
+  if (b.__send || (b.resend && on)) { sent = fbNotify(room); if (b.resend && !notifiedAt) { notifiedAt = Date.now(); pushMessage(room, { type: 'cfg-fb', key: 'cfg:fb', src: 'admin', data: { on, url, notifiedAt, at: Date.now() } }); } }
+  console.log('Seguinos en Facebook', on ? 'ACTIVADO' : 'desactivado', '· avisos enviados', sent);
+  res.json({ ok: true, on, url, notifiedAt, sent, counts: fbCounts(room), welcomeOn: welCfg(room).on });
+});
 const ERASE_TYPES = new Set(['pax-reg', 'driver-reg', 'pax-chg', 'drv-chg', 'seller-reg']);
 app.post('/api/admin/erase', async (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -2342,6 +2388,7 @@ app.post('/api/admin/erase', async (req, res) => {
   memDocs.forEach((k) => docMem.delete(k));
   for (const [h] of subs) { pushSubs.delete(h); pushQueue.delete(h); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]); } catch (e) { console.warn('erase push', e.message); } } }
   for (const [u] of vers) { waVerified.delete(u); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'wa' AND id = $1`, [u]); } catch (e) { console.warn('erase wa', e.message); } } }
+  for (const id of ids) { const k = room.name + '|' + id; if (fbDone.delete(k) && db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'fb' AND id = $1`, [k]); } catch (e) { console.warn('erase fb', e.message); } } }   /* V586 */
   console.log('Cuenta eliminada · …' + tail.slice(-4), '· cuentas', accounts.length, '· documentos', plan.docs, '· avisos', plan.avisos);
   res.json({ ok: true, dry: false, found: true, done: true, plan, retained: 'viajes, pagos, comisiones, calificaciones y reportes' });
 });
@@ -2445,6 +2492,7 @@ function welStatus(room, paxId) {
   if (mine.some((r) => welDay(r.done) === welDay(now))) return Object.assign(out, { can: false, why: 'today' });
   if (welPaidBefore(room, paxId, first || now, new Set(mine.map((r) => r.tk)))) return Object.assign(out, { can: false, why: 'traveled' });
   if (c.cap && !live.length) { const d = welDay(now); const n = all.filter((r) => (r.done && welDay(r.done) === d) || (welLive(r, now) && welDay(r.at) === d)).length; if (n >= c.cap) return Object.assign(out, { can: false, why: 'cap' }); }
+  if (fbCfg(room).on && !fbDone.has(room.name + '|' + paxId)) return Object.assign(out, { can: false, why: 'fb' });   /* V586 · falta seguir la página */
   if (live.length) out.hold = live[0].tk;
   return Object.assign(out, { can: true });
 }
