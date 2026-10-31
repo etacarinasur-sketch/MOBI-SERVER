@@ -2512,9 +2512,12 @@ app.post('/api/admin/pin', (req, res) => {
 /* V618 · aviso de app de Android nueva (solo se ve en el APK). Apagado de fábrica. */
 app.post('/api/admin/apkupd', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
-  const room = getRoom(b.room), m = room.sticky.get('cfg-apkupd|cfg:apkupd'); let on = !!(m && m.data && m.data.on);
-  if (b.on !== undefined) { on = !!b.on; pushMessage(room, { type: 'cfg-apkupd', key: 'cfg:apkupd', src: 'admin', data: { on, at: Date.now() } }); console.log('Aviso de app nueva', on ? 'ACTIVADO' : 'desactivado'); }
-  res.json({ ok: true, on });
+  const room = getRoom(b.room), m = room.sticky.get('cfg-apkupd|cfg:apkupd'); let on = !!(m && m.data && m.data.on), ver = Math.max(0, Math.floor(Number(m && m.data && m.data.ver) || 0)), ch = false;
+  if (b.on !== undefined) { on = !!b.on; ch = true; }
+  /* V619 · versión de referencia: la toma sola del APK del administrador (solo sube), o la pone a mano */
+  if (b.ver !== undefined) { const v = Math.max(0, Math.min(1e7, Math.floor(Number(b.ver) || 0))); if (b.auto ? v > ver : v !== ver) { ver = v; ch = true; } }
+  if (ch) { pushMessage(room, { type: 'cfg-apkupd', key: 'cfg:apkupd', src: 'admin', data: { on, ver, at: Date.now() } }); console.log('Aviso de app nueva', on ? 'ACTIVADO' : 'desactivado', '· versión de referencia', ver); }
+  res.json({ ok: true, on, ver });
 });
 const ERASE_TYPES = new Set(['pax-reg', 'driver-reg', 'pax-chg', 'drv-chg', 'seller-reg']);
 app.post('/api/admin/erase', async (req, res) => {
