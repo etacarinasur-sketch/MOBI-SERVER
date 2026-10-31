@@ -1461,8 +1461,16 @@ app.post('/api/admin/finance', (req, res) => {
       vol += Number(sm.fare) || 0; fee += Number(sm.fee) || 0; trips++;
     } else if ((x.type === 'debt-charge' || x.type === 'debt-pay') && x.data && x.data.driver) drivers.add(String(x.data.driver));
   }
-  let owed = 0, paid = 0; for (const d of drivers) { const L = ledgerOf(room, d); owed += L.debt; paid += L.paid; }
-  const r2 = (n) => Math.round(n * 100) / 100, d = { ok: true, at: Date.now(), vol: r2(vol), fee: r2(fee), trips, owed: r2(owed), paid: r2(paid), drivers: drivers.size };
+  let owed = 0, paid = 0; const names = new Map(), rows = [], byKind = {}, byTk = new Map();
+  for (const x of room.sticky.values()) if (x && x.type === 'driver-reg' && x.data && x.data.id) names.set(String(x.data.id), String(x.data.name || ''));
+  for (const d of drivers) { const L = ledgerOf(room, d); owed += L.debt; paid += L.paid;
+    for (const y of L.list) { if (y.type !== 'charge') continue; const k = String(y.kind || (/^Comisión de viaje/.test(y.note || '') ? 'comision' : 'otro')); const o = byKind[k] || (byKind[k] = { n: 0, amt: 0 }); o.n++; o.amt += Number(y.amount) || 0;
+      if (y.tripKey && k === 'comision') { const t = byTk.get(y.tripKey) || { n: 0, amt: 0, drv: d }; t.n++; t.amt += Number(y.amount) || 0; byTk.set(y.tripKey, t); } }
+    if (L.debt || L.paid || L.charges || L.cred) rows.push({ id: d, name: names.get(d) || '', charges: Math.round(L.charges), paid: Math.round(L.paid), cred: Math.round(L.cred), payDone: Math.round(L.payDone), debt: Math.round(L.debt), favor: Math.round(L.favor) }); }
+  rows.sort((a, b) => b.debt - a.debt);
+  const dup = []; for (const [k, t] of byTk) if (t.n > 1) dup.push({ tripKey: k, n: t.n, amt: Math.round(t.amt) });
+  for (const k of Object.keys(byKind)) byKind[k].amt = Math.round(byKind[k].amt);
+  const r2 = (n) => Math.round(n * 100) / 100, d = { ok: true, at: Date.now(), vol: r2(vol), fee: r2(fee), trips, owed: r2(owed), paid: r2(paid), drivers: drivers.size, audit: { byKind, rows: rows.slice(0, 40), dup: dup.slice(0, 20), dupN: dup.length } };
   finCache.set(room.name, { t: Date.now(), d }); res.json(d);
 });
 /* V510 · el administrador libera a mano un saldo retenido (por ejemplo, un cobro con tarjeta que no se pudo comprobar solo) */
@@ -1811,7 +1819,7 @@ async function histFlush() {
 setInterval(() => { histFlush().catch(() => {}); }, 45_000).unref();
 async function histLoad() {
   if (!db) return;
-  try { const r = await db.query(`SELECT ns, id, data FROM mobi_kv WHERE ns IN ('dhist','dsess')`); for (const row of r.rows) { if (row.ns === 'dhist') dHist.set(row.id, (row.data && row.data.list) || []); else dSess.set(row.id, row.data || { list: [], cur: null }); } console.log('Historial de conductores cargado:', dHist.size, 'con viajes,', dSess.size, 'con conexiones'); } catch (e) { console.warn('histLoad', e.message); }
+  try { const r = await db.query(`SELECT ns, id, data FROM mobi_kv WHERE ns IN ('dhist','dsess','dgeo')`); for (const row of r.rows) { if (row.ns === 'dgeo') { if (row.data && row.data.geo) tGeo.set(row.id, row.data.geo); } else if (row.ns === 'dhist') dHist.set(row.id, (row.data && row.data.list) || []); else dSess.set(row.id, row.data || { list: [], cur: null }); } console.log('Historial de conductores cargado:', dHist.size, 'con viajes,', dSess.size, 'con conexiones'); } catch (e) { console.warn('histLoad', e.message); }
 }
 app.post('/api/admin/driver-history', (req, res) => {
   const b = req.body || {};
@@ -1833,6 +1841,32 @@ app.post('/api/admin/driver-history', (req, res) => {
 
 /* V513 · «Mi historial» desde el servidor: los viajes no se pierden al reinstalar la app, cambiar de celular o pasar de la APK al navegador.
    Solo el dueño de la cuenta (celular vinculado) puede pedir el suyo. */
+/* V599 · el RECORRIDO de cada viaje queda guardado en el servidor (antes solo vivía en el celular y se perdía al actualizar/reinstalar) */
+const tGeo = new Map();
+const baseTid = (id) => String(id || '').replace(/^srv_/, '').replace(/^(trip_\d+)[pd]$/, '$1');
+const geoOf = (room, id) => tGeo.get(HK(room, baseTid(id))) || undefined;
+function cleanGeo(g) {
+  if (!g || typeof g !== 'object') return null;
+  const pt = (q) => (Array.isArray(q) && q.length >= 2 && isFinite(q[0]) && isFinite(q[1]) && Math.abs(q[0]) <= 90 && Math.abs(q[1]) <= 180) ? [Math.round(q[0] * 1e5) / 1e5, Math.round(q[1] * 1e5) / 1e5] : null;
+  const arr = (a, n) => Array.isArray(a) ? a.slice(0, n).map(pt).filter(Boolean) : null;
+  const o = { o: pt(g.o), d: pt(g.d), s: pt(g.s), ss: arr(g.ss, 6), plan: arr(g.plan, 160), real: arr(g.real, 160) };
+  if (!o.o && !o.d && !(o.plan && o.plan.length > 1) && !(o.real && o.real.length > 1)) return null;
+  for (const k of Object.keys(o)) if (!o[k] || (Array.isArray(o[k]) && !o[k].length)) delete o[k];
+  return o;
+}
+app.post('/api/my/geo', (req, res) => {
+  const b = req.body || {}, r = getRoom(b.room), au = authOf(req, r.name);
+  const drv = String(b.drv || ''), pax = String(b.pax || '');
+  const okD = OWN_RE.drv.test(drv) && (au.admin || ownHas(r, 'drv', drv, au.sk)), okP = OWN_RE.pax.test(pax) && (au.admin || ownHas(r, 'pax', pax, au.sk));
+  if (!okD && !okP && !au.sk) return res.status(403).json({ ok: false, error: 'forbidden' });
+  const items = Array.isArray(b.items) ? b.items.slice(0, 25) : [], done = [];
+  for (const it of items) {
+    const id = baseTid(it && it.id), g = cleanGeo(it && it.geo); if (!id || !g) continue;
+    const k = HK(r, id); if (!tGeo.has(k)) { tGeo.set(k, g); kvSet('dgeo', k, { geo: g }).catch(() => {}); }
+    done.push(String(it.id));
+  }
+  res.json({ ok: true, done });
+});
 app.post('/api/my/history', (req, res) => {
   const b = req.body || {}, r = getRoom(b.room), au = authOf(req, r.name);
   const drv = String(b.drv || ''), pax = String(b.pax || ''), out = { drv: [], pax: [] };
@@ -1841,7 +1875,7 @@ app.post('/api/my/history', (req, res) => {
   if (!okD && !okP && !au.sk) return res.status(403).json({ ok: false, error: 'forbidden' });
   const byId = new Map();   /* viajes de conductores por id (para completar los del pasajero viejos) */
   if (okP) for (const [k, l] of dHist) if (k.startsWith(r.name + '|') && !k.startsWith(r.name + '|p:')) for (const x of l) byId.set(x.id, Object.assign({ driverId: k.slice(r.name.length + 1) }, x));
-  if (okD) for (const x of (dHist.get(HK(r, drv)) || [])) out.drv.push({ id: 'srv_' + x.id, at: x.at, route: x.route, stop: x.stop, fare: x.fare, net: x.net, fee: x.fee, payment: x.payment, status: x.status || 'Finalizado', other: x.pax, driverId: drv, srv: 1, bad: x.bad ? true : undefined });
+  if (okD) for (const x of (dHist.get(HK(r, drv)) || [])) out.drv.push({ geo: geoOf(r, x.id), id: 'srv_' + x.id, at: x.at, route: x.route, stop: x.stop, fare: x.fare, net: x.net, fee: x.fee, payment: x.payment, status: x.status || 'Finalizado', other: x.pax, driverId: drv, srv: 1, bad: x.bad ? true : undefined });
   const okS = !!au.sk && !au.admin;   /* viajes pedidos desde ESTE celular aunque la cuenta no esté vinculada */
   if (okS && !byId.size) for (const [k, l] of dHist) if (k.startsWith(r.name + '|') && !k.startsWith(r.name + '|p:')) for (const x of l) byId.set(x.id, Object.assign({ driverId: k.slice(r.name.length + 1) }, x));
   const paxLists = [].concat(okP ? (dHist.get(HK(r, 'p:' + pax)) || []) : [], okS ? (dHist.get(HK(r, 'p:sk:' + au.sk)) || []) : []), seenP = new Set();
@@ -1850,7 +1884,7 @@ app.post('/api/my/history', (req, res) => {
     const dx = byId.get(x.id) || {};
     if (!x.route && !x.bad) continue;   /* V514 · anotaciones viejas mal hechas (eran del conductor) */
     if (au.sk && ownHas(r, 'drv', String(x.driverId || dx.driverId || ''), au.sk)) continue;   /* un viaje que manejaste vos no es un viaje tuyo como pasajero */
-    out.pax.push({ id: 'srv_' + x.id, at: x.at, route: x.route || dx.route || '', stop: x.stop || dx.stop || '', fare: x.fare || dx.fare || 0, payment: x.payment || dx.payment || '', status: x.status || dx.status || 'Finalizado', bad: x.bad ? true : undefined, other: x.drvName || '', plate: x.plate || dx.plate || '', paxId: pax, driverId: x.driverId || dx.driverId || '', srv: 1 });
+    out.pax.push({ geo: geoOf(r, x.id), id: 'srv_' + x.id, at: x.at, route: x.route || dx.route || '', stop: x.stop || dx.stop || '', fare: x.fare || dx.fare || 0, payment: x.payment || dx.payment || '', status: x.status || dx.status || 'Finalizado', bad: x.bad ? true : undefined, other: x.drvName || '', plate: x.plate || dx.plate || '', paxId: pax, driverId: x.driverId || dx.driverId || '', srv: 1 });
   }
   out.drv.sort((p, q) => q.at - p.at); out.pax.sort((p, q) => q.at - p.at);
   res.json({ ok: true, drv: out.drv.slice(0, 300), pax: out.pax.slice(0, 300) });
