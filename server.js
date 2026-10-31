@@ -2509,6 +2509,13 @@ app.post('/api/admin/pin', (req, res) => {
   if (b.on !== undefined) { on = !!b.on; pushMessage(room, { type: 'cfg-pin', key: 'cfg:pin', src: 'admin', data: { on, at: Date.now() } }); console.log('Código de conductores', on ? 'ACTIVADO' : 'desactivado'); }
   res.json({ ok: true, on });
 });
+/* V620 · configuración pública chiquita (código de 4 dígitos y aviso de app nueva): cada celular la pide al abrir,
+   por si se perdió el aviso del bus al arrancar. Sin datos personales. */
+app.get('/api/cfg/pub', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const room = getRoom(req.query.room), p = room.sticky.get('cfg-pin|cfg:pin'), a = room.sticky.get('cfg-apkupd|cfg:apkupd');
+  res.json({ ok: true, pin: !!(p && p.data && p.data.on), apk: { on: !!(a && a.data && a.data.on), ver: Math.max(0, Math.floor(Number(a && a.data && a.data.ver) || 0)) } });
+});
 /* V618 · aviso de app de Android nueva (solo se ve en el APK). Apagado de fábrica. */
 app.post('/api/admin/apkupd', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
