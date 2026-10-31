@@ -38,6 +38,7 @@ app.disable('x-powered-by');
 /* ===================== V607 · CONSUMO DE DATOS: compresión + contador por tipo =====================
    Render cobra por lo que SALE del servidor (plan Hobby: 5 GB por mes incluidos). Todo lo que pase de 1 KB (JSON o texto) viaja comprimido (gzip),
    la página de la app se manda comprimida y con ETag (si no cambió, el celular no la baja de nuevo) y se cuenta cuánto sale por tipo de pedido. */
+const NOTE = { on: false, rooms: new Map(), rate: new Map() };
 const LP = { on: false };   // V607 · consulta en espera (ver más abajo)
 const LP_LOW = new Set(['drv-pres', 'driver-pos', 'pax-pos']);   // estos avisos no despiertan al instante (se juntan hasta 4 s)
 const USE = { since: Date.now(), days: {} };   // days['AAAA-MM-DD'][categoría] = { n, out, inb, raw }
@@ -171,6 +172,7 @@ async function dbInit() {
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
     try { const lp = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'lp' AND id = 'cfg'`); if (lp.rows[0] && lp.rows[0].data) LP.on = !!lp.rows[0].data.on; } catch (e) { console.warn('lp', e.message); }   /* V607 */
     try { const us = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'usage' AND id = 'all'`); if (us.rows[0] && us.rows[0].data && us.rows[0].data.days) { for (const [d, v] of Object.entries(us.rows[0].data.days)) if (!USE.days[d]) USE.days[d] = v; if (us.rows[0].data.since) USE.since = Math.min(USE.since, Number(us.rows[0].data.since) || USE.since); } } catch (e) { console.warn('usage', e.message); }   /* V607 */
+    try { const nc = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'notecfg' AND id = 'cfg'`); if (nc.rows[0] && nc.rows[0].data) NOTE.on = !!nc.rows[0].data.on; const nn = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'notes'`); for (const row of nn.rows) if (row.data && Array.isArray(row.data.list) && !NOTE.rooms.has(row.id)) NOTE.rooms.set(row.id, row.data.list); } catch (e) { console.warn('notes', e.message); }   /* V611 */
     try { const fk = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'fb'`); for (const row of fk.rows) if (row.data && !fbDone.has(row.id)) fbDone.set(row.id, row.data); } catch (e) { console.warn('fb', e.message); }   /* V586 */
     try { const rv = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'revisor' AND id = 'cfg'`); if (rv.rows[0] && rv.rows[0].data) REV = Object.assign(REV, rv.rows[0].data); } catch (e) { console.warn('revisor', e.message); }   /* V584 */
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
@@ -2781,6 +2783,14 @@ app.post('/api/docs/get', async (req, res) => {
   const b = req.body || {}, owner = String(b.owner || '');
   if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin_only' });
   if (!okOwner(owner)) return res.status(400).json({ ok: false, error: 'bad_owner' });
+  /* V613 · solo algunas fotos (por ejemplo la de perfil para la lista de Administración): mucho más liviano que traer todos los documentos */
+  const kinds = Array.isArray(b.kinds) ? b.kinds.map((k) => String(k || '')).filter((k) => /^[a-zA-Z]{2,12}$/.test(k)).slice(0, 6) : null;
+  if (kinds && kinds.length) {
+    const out = {};
+    if (db) { try { const r = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'doc' AND id = ANY($1)`, [kinds.map((k) => owner + '|' + k)]); for (const row of r.rows) out[row.id.split('|')[1]] = row.data.img; } catch (e) { console.warn('docs', e.message); } }
+    for (const k of kinds) { const v = docMem.get(owner + '|' + k); if (v && !out[k]) out[k] = v.img; }
+    return res.json({ ok: true, docs: out });
+  }
   res.json({ ok: true, docs: await docsOf(owner) });
 });
 
@@ -2860,6 +2870,66 @@ app.post('/api/admin/usage', (req, res) => {
   if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
   res.setHeader('Cache-Control', 'no-store');
   res.json({ ok: true, since: USE.since, today: useDay(), days: USE.days, upMin: Math.round(process.uptime() / 60), lp: LP.on });
+});
+
+/* V611 · mensajes directos de Administración (advertencia / suspensión / premio / aviso) a una persona o a todos los conductores o pasajeros.
+   El texto NO viaja por el bus (lo vería cualquiera): se guarda acá y cada celular lo pide con su propio identificador. Apagado por defecto. */
+const NOTE_KINDS = { advertencia: '⚠️ Advertencia', suspension: '🚫 Suspensión', premio: '🏆 Premio', aviso: '📢 Aviso' };
+const noteList = (rn) => { let l = NOTE.rooms.get(rn); if (!l) { l = []; NOTE.rooms.set(rn, l); } return l; };
+const noteSave = (rn) => { const l = noteList(rn); if (l.length > 300) l.splice(0, l.length - 300); kvSet('notes', rn, { list: l }).catch(() => {}); };
+const noteIds = (a) => (Array.isArray(a) ? a : []).map((u) => String(u || '').slice(0, 60)).filter((u) => /^[A-Za-z0-9_.:-]{3,60}$/.test(u)).slice(0, 4);
+const noteRate = (req) => { const ip = String(req.ip || ''), now = Date.now(), r = NOTE.rate.get(ip) || { n: 0, t: now }; if (now - r.t > 60000) { r.n = 0; r.t = now; } r.n++; NOTE.rate.set(ip, r); if (NOTE.rate.size > 5000) NOTE.rate.delete(NOTE.rate.keys().next().value); return r.n <= 40; };
+app.post('/api/admin/note-cfg', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  if (b.on !== undefined) { NOTE.on = !!b.on; kvSet('notecfg', 'cfg', { on: NOTE.on }).catch(() => {}); console.log('Mensajes directos', NOTE.on ? 'ENCENDIDOS' : 'apagados'); }
+  res.json({ ok: true, on: NOTE.on });
+});
+app.post('/api/admin/note', async (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  if (!NOTE.on) return res.status(409).json({ ok: false, error: 'off' });
+  const kind = Object.prototype.hasOwnProperty.call(NOTE_KINDS, b.kind) ? b.kind : '', text = String(b.text || '').trim().slice(0, 500), ids = noteIds(b.ids), all = b.all === 'drv' || b.all === 'pax' ? b.all : '';
+  if (!kind || !text || (!ids.length && !all)) return res.status(400).json({ ok: false, error: 'datos' });
+  const r = getRoom(b.room), now = Date.now(), note = { id: 'n' + now.toString(36) + crypto.randomBytes(3).toString('hex'), at: now, kind, text, ids, all, read: {} };
+  noteList(r.name).push(note); noteSave(r.name);
+  const title = NOTE_KINDS[kind] + ' · MOBI', body = text.slice(0, 180), acc = []; let sent = 0, people = ids.length;
+  const targets = new Set(ids);
+  if (all) { for (const [k, m] of r.sticky) { const d = m && m.data; if (!d || typeof d !== 'object' || !d.id || d.deletedAt) continue;
+    if (all === 'pax' ? !(m.type === 'pax-reg' && k.startsWith('pax-reg|pr:')) : !(m.type === 'driver-reg' && k.startsWith('driver-reg|dr:') && d.status === 'aprobado' && !drvHidden(d))) continue; targets.add(String(d.id)); } people = targets.size; }
+  try { for (const id of targets) if (pushNotify(id, { title, body }, acc)) sent++; await Promise.all(acc); } catch (e) {}
+  try { pushMessage(r, { type: 'note-ping', src: 'server', data: { id: note.id, ids, all } }); } catch (e) {}
+  console.log('Mensaje directo', kind, all || ids.join(','), '→', sent, 'con aviso al celular');
+  res.json({ ok: true, id: note.id, people, sent });
+});
+app.post('/api/admin/note-list', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room);
+  res.json({ ok: true, on: NOTE.on, list: noteList(r.name).slice(-60).reverse().map((n) => ({ id: n.id, at: n.at, kind: n.kind, text: n.text, ids: n.ids, all: n.all, read: Object.keys(n.read || {}).length })) });
+});
+app.post('/api/note/pull', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (!noteRate(req)) return res.status(429).json({ ok: false });
+  const b = req.body || {}, ids = noteIds(b.ids), roles = (Array.isArray(b.roles) ? b.roles : []).filter((x) => x === 'drv' || x === 'pax');
+  if (!NOTE.on || !ids.length) return res.json({ ok: true, on: NOTE.on, notes: [] });
+  const r = getRoom(b.room), now = Date.now(), out = [];
+  for (const n of noteList(r.name)) {
+    if (now - n.at > 30 * 86400_000) continue;
+    if (ids.some((i) => n.read && n.read[i])) continue;
+    if (!(n.ids.some((i) => ids.includes(i)) || (n.all && roles.includes(n.all)))) continue;
+    out.push({ id: n.id, kind: n.kind, text: n.text, at: n.at }); if (out.length >= 5) break;
+  }
+  res.json({ ok: true, on: true, notes: out });
+});
+app.post('/api/note/ack', (req, res) => {
+  if (!noteRate(req)) return res.status(429).json({ ok: false });
+  const b = req.body || {}, ids = noteIds(b.ids), nids = (Array.isArray(b.notes) ? b.notes : []).map((x) => String(x || '').slice(0, 40)).slice(0, 10);
+  if (!ids.length || !nids.length) return res.json({ ok: true });
+  const r = getRoom(b.room), now = Date.now(); let ch = false;
+  for (const n of noteList(r.name)) if (nids.includes(n.id)) { n.read = n.read || {}; for (const i of ids) if (!n.read[i] && Object.keys(n.read).length < 3000) { n.read[i] = now; ch = true; } }
+  if (ch) noteSave(r.name);
+  res.json({ ok: true });
 });
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
 /* al apagar, guardar lo pendiente */
