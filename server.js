@@ -3,6 +3,7 @@ import cors from 'cors';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 /* =====================================================================
@@ -33,6 +34,57 @@ const WA_TOKEN = process.env.WA_TOKEN || '';                                    
 let WA_PHONE_ID = process.env.WA_PHONE_ID || '';                                  // si falta, se busca solo con WA_WABA_ID
 
 app.disable('x-powered-by');
+
+/* ===================== V607 · CONSUMO DE DATOS: compresión + contador por tipo =====================
+   Render cobra por lo que SALE del servidor (plan Hobby: 5 GB por mes incluidos). Todo lo que pase de 1 KB (JSON o texto) viaja comprimido (gzip),
+   la página de la app se manda comprimida y con ETag (si no cambió, el celular no la baja de nuevo) y se cuenta cuánto sale por tipo de pedido. */
+const LP = { on: false };   // V607 · consulta en espera (ver más abajo)
+const LP_LOW = new Set(['drv-pres', 'driver-pos', 'pax-pos']);   // estos avisos no despiertan al instante (se juntan hasta 4 s)
+const USE = { since: Date.now(), days: {} };   // days['AAAA-MM-DD'][categoría] = { n, out, inb, raw }
+const useDay = () => new Date(Date.now() - 3 * 3600_000).toISOString().slice(0, 10);
+function useCat(req) {
+  const u = String(req.originalUrl || req.url || '').split('?')[0];
+  if (u === '/' || u === '/index.html') return 'La app (index.html)';
+  const m = u.match(/^\/api\/([^/]+)(?:\/([^/]+))?/);
+  if (!m) return 'Otros';
+  if (m[1] === 'bus') return req.method === 'GET' ? 'Consulta de novedades (bus GET)' : 'Envío de novedades (bus POST)';
+  if (m[1] === 'admin') return 'Administración';
+  if (m[1] === 'drv' && m[2] === 'offers') return 'Viajes ofrecidos (APK)';
+  if (m[1] === 'push') return 'Avisos (push)';
+  if (m[1] === 'my') return 'Historial y recorridos';
+  return '/api/' + m[1];
+}
+function useAdd(cat, out, inb, raw) {
+  const d = useDay(), day = USE.days[d] || (USE.days[d] = {}), c = day[cat] || (day[cat] = { n: 0, out: 0, inb: 0, raw: 0 });
+  c.n++; c.out += out; c.inb += inb; c.raw += raw;
+  USE.dirty = true;
+}
+app.use((req, res, next) => {
+  const cat = useCat(req); let out = 0, raw = 0;
+  const w = res.write, e = res.end;
+  const len = c => c == null ? 0 : (Buffer.isBuffer(c) ? c.length : (typeof c === 'string' ? Buffer.byteLength(c) : 0));
+  res.write = function (c, ...a) { out += len(c); return w.call(this, c, ...a); };
+  res.end = function (c, ...a) { out += len(c); return e.call(this, c, ...a); };
+  res.on('finish', () => { try { useAdd(cat, out + 250, Number(req.headers['content-length']) || 0, raw || out); } catch (x) {} });
+  if (/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) {
+    const send = res.send;
+    res.send = function (body) {
+      try {
+        if (!this.headersSent && !this.getHeader('Content-Encoding') && req.method !== 'HEAD' && (typeof body === 'string' || Buffer.isBuffer(body))) {
+          const n = len(body), ct = String(this.getHeader('Content-Type') || '');
+          if (n >= 1024 && (!ct || /json|text|javascript|xml|html|svg/i.test(ct))) {
+            if (!ct && typeof body === 'string') this.setHeader('Content-Type', 'text/html; charset=utf-8');
+            const z = zlib.gzipSync(Buffer.isBuffer(body) ? body : Buffer.from(body), { level: 5 });
+            raw += n; this.setHeader('Content-Encoding', 'gzip'); this.setHeader('Vary', 'Accept-Encoding'); this.removeHeader('Content-Length');
+            return send.call(this, z);
+          }
+        }
+      } catch (x) {}
+      return send.call(this, body);
+    };
+  }
+  next();
+});
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGIN.includes('*') || ALLOWED_ORIGIN.includes(origin)) return cb(null, true);
@@ -44,8 +96,18 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { if (req.url && req.url.startsWith('/api/wa/webhook')) req.rawBody = buf; } }));
 
 const indexFile = path.join(__dirname, 'index.html');
-app.get(['/', '/index.html'], (_req, res) => {
-  if (fs.existsSync(indexFile)) return res.sendFile(indexFile);
+let idxC = { m: 0, raw: null, gz: null, tag: '' };
+app.get(['/', '/index.html'], (req, res) => {
+  if (fs.existsSync(indexFile)) {
+    try {   /* V607 · comprimida (de ~3 MB a ~0,6 MB) y con ETag: si no cambió, el celular recibe solo un «304» */
+      const st = fs.statSync(indexFile);
+      if (st.mtimeMs !== idxC.m) { const raw = fs.readFileSync(indexFile); idxC = { m: st.mtimeMs, raw, gz: zlib.gzipSync(raw, { level: 9 }), tag: 'W/"' + Math.round(st.mtimeMs) + '-' + raw.length + '"' }; }
+      res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.setHeader('Vary', 'Accept-Encoding'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('ETag', idxC.tag);
+      if (String(req.headers['if-none-match'] || '').split(',').some((t) => t.trim().replace(/^W\//, '') === idxC.tag.replace(/^W\//, ''))) return res.status(304).end();
+      if (/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) { res.setHeader('Content-Encoding', 'gzip'); res.setHeader('Content-Length', idxC.gz.length); return res.end(idxC.gz); }
+      res.setHeader('Content-Length', idxC.raw.length); return res.end(idxC.raw);
+    } catch (e) { return res.sendFile(indexFile); }
+  }
   res.type('text/plain').send('MOBI-SERVER OK · la app (index.html) está en otro repositorio. Probá /health');
 });
 
@@ -107,6 +169,8 @@ async function dbInit() {
     try { const rr = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'remind'`); for (const row of rr.rows) if (row.data) remMem.set(row.id, row.data); } catch (e) { console.warn('remind', e.message); }   /* V576 */
     try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h && !ownMap.has(row.id)) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
+    try { const lp = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'lp' AND id = 'cfg'`); if (lp.rows[0] && lp.rows[0].data) LP.on = !!lp.rows[0].data.on; } catch (e) { console.warn('lp', e.message); }   /* V607 */
+    try { const us = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'usage' AND id = 'all'`); if (us.rows[0] && us.rows[0].data && us.rows[0].data.days) { for (const [d, v] of Object.entries(us.rows[0].data.days)) if (!USE.days[d]) USE.days[d] = v; if (us.rows[0].data.since) USE.since = Math.min(USE.since, Number(us.rows[0].data.since) || USE.since); } } catch (e) { console.warn('usage', e.message); }   /* V607 */
     try { const fk = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'fb'`); for (const row of fk.rows) if (row.data && !fbDone.has(row.id)) fbDone.set(row.id, row.data); } catch (e) { console.warn('fb', e.message); }   /* V586 */
     try { const rv = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'revisor' AND id = 'cfg'`); if (rv.rows[0] && rv.rows[0].data) REV = Object.assign(REV, rv.rows[0].data); } catch (e) { console.warn('revisor', e.message); }   /* V584 */
     const w = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wa'`);
@@ -257,6 +321,7 @@ function pushMessage(room, m) {
       if (o && (st === 'aprobado' || st === 'rechazado') && String(o.status || 'pendiente') !== st) { const mo = c.vtype === 'moto';
         pushNotify(String(msg.data.id || ''), st === 'aprobado' ? { title: mo ? '🏍️ ¡Tu moto fue aprobada!' : '🚗 ¡Tu auto fue aprobado!', body: 'Ya podés trabajar con ' + (c.model || 'tu vehículo') + '. Abrí MOBI y elegilo en «Trabajás con».' } : { title: mo ? 'Tu moto no fue aprobada' : 'Tu auto no fue aprobado', body: 'Revisá los datos y la documentación de ' + (c.model || 'tu vehículo') + ' en Configuración.' }); } } } } catch (e) {}
   room.ring.push(msg);
+  try { lpWake(room, LP_LOW.has(msg.type)); } catch (e) {}   /* V607 */
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
   if (msg.key) { room.sticky.set(msg.type + '|' + msg.key, msg); persistSticky(room.name, msg.type + '|' + msg.key, msg); }
   return msg;
@@ -684,7 +749,7 @@ app.post('/api/bus', (req, res) => {
   res.json({ ok: true, id: saved.id });
 });
 
-app.get('/api/bus', (req, res) => {
+function busHandle(req, res) {
   const r = getRoom(req.query.room);
   const after = Number(req.query.after) || 0;
   const me = String(req.query.src || '');
@@ -743,8 +808,28 @@ app.get('/api/bus', (req, res) => {
   /* V448 · sin pérdidas: si hay más de 400, se entregan los primeros y el resto en el próximo sondeo */
   let last = r.seq, list = out;
   if (list.length > 400) { list = list.slice(0, 400); last = list[list.length - 1].id; }
-  res.json({ ok: true, messages: list.map(({ priv, tk, ...m }) => m), last });
+  res.json(LP.on ? { ok: true, messages: list.map(({ priv, tk, ...m }) => m), last, lp: 1 } : { ok: true, messages: list.map(({ priv, tk, ...m }) => m), last });
+}
+/* V607 · CONSULTA EN ESPERA (apagada de fábrica; la enciende Administración): en vez de preguntar «¿hay novedades?» cada 1-2 segundos, el celular deja
+   la pregunta abierta hasta 20 s y el servidor contesta apenas hay algo (o a los 20 s). Mismo resultado, muchísimos menos pedidos. */
+app.get('/api/bus', (req, res) => {
+  const wait = Math.min(25, Math.max(0, Number(req.query.wait) || 0)), after = Number(req.query.after) || 0;
+  if (!LP.on || !wait || after <= 0) return busHandle(req, res);
+  const r = getRoom(req.query.room);
+  if (r.seq > after) return busHandle(req, res);   // ya hay novedades
+  if (!r.lp) r.lp = new Set();
+  let done = false;
+  const w = () => { if (done) return; done = true; clearTimeout(t); r.lp.delete(w); try { busHandle(req, res); } catch (e) { try { res.status(500).json({ ok: false }); } catch (x) {} } };
+  const t = setTimeout(w, wait * 1000);
+  r.lp.add(w);
+  req.on('close', () => { if (done) return; done = true; clearTimeout(t); r.lp.delete(w); });
 });
+function lpWake(room, low) {
+  if (!LP.on || !room.lp || !room.lp.size) return;
+  const k = low ? 'lpL' : 'lpH';
+  if (room[k]) return;
+  room[k] = setTimeout(() => { room[k] = null; for (const w of [...(room.lp || [])]) w(); }, low ? 4000 : 30);
+}
 
 /* ------------- adjudicación atómica de viajes ------------- */
 /* V532 · el servicio nativo «Estás en línea» de la APK pregunta acá si hay pedidos esperando cerca (liviano: no baja todo el bus).
@@ -2761,6 +2846,21 @@ if (SELF_URL && process.env.KEEPALIVE !== '0') {
 }
 
 await Promise.race([dbInit(), new Promise((r) => setTimeout(r, 25_000))]);
+
+/* V607 · consumo del servidor (solo Administración) */
+setInterval(() => { try { if (!USE.dirty) return; USE.dirty = false; const keep = Object.keys(USE.days).sort().slice(-35), o = {}; for (const k of keep) o[k] = USE.days[k]; USE.days = o; kvSet('usage', 'all', { since: USE.since, days: o }).catch(() => {}); } catch (e) {} }, 300_000);
+app.post('/api/admin/lp', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  if (b.on !== undefined) { LP.on = !!b.on; kvSet('lp', 'cfg', { on: LP.on }).catch(() => {}); console.log('Consulta en espera', LP.on ? 'ENCENDIDA' : 'apagada'); if (!LP.on) for (const r of rooms.values()) if (r.lp) for (const w of [...r.lp]) w(); }
+  res.json({ ok: true, on: LP.on });
+});
+app.post('/api/admin/usage', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, since: USE.since, today: useDay(), days: USE.days, upMin: Math.round(process.uptime() / 60), lp: LP.on });
+});
 app.listen(PORT, () => console.log(`MOBI-SERVER v5 escuchando en el puerto ${PORT} · base de datos: ${dbState}`));
 /* al apagar, guardar lo pendiente */
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { try { for (let i = 0; i < 50 && flushing; i++) await new Promise((r) => setTimeout(r, 100)); for (const [k, v] of dirtySlow) dirty.set(k, v); await flushSticky(); } catch (e) {} process.exit(0); });
