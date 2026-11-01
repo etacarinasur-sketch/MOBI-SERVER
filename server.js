@@ -2011,6 +2011,7 @@ app.post('/api/admin/user-stats', (req, res) => {
   const seenT = new Set();
   const add = (kind, id, tid, at) => { const o = out[kind][id] || (out[kind][id] = { trips: 0, last: 0 }); o.trips++; if (at > o.last) o.last = at; seenT.add(kind + '|' + id + '|' + tid); };
   for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) if (!x.bad) add('drv', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.drv)) { try { const L = ledgerOf(r, id), o = out.drv[id] || (out.drv[id] = { trips: 0, last: 0 }); o.debt = L.debt; o.favor = L.favor; o.charges = Math.round(L.charges * 100) / 100; } catch (e) {} }   /* V632 · la deuda de la ficha = la que calcula el servidor (la misma que ve el conductor) */
   for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) if (!x.bad) add('pax', id, x.id, Number(x.at) || 0);
   const wantD = new Set(ids(bd.drv)), wantP = new Set(ids(bd.pax));
   for (const m of r.sticky.values()) {   /* viajes que todavía están en el bus y no se anotaron */
