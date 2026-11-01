@@ -2514,7 +2514,8 @@ app.post('/api/admin/pin', (req, res) => {
 app.get('/api/cfg/pub', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const room = getRoom(req.query.room), p = room.sticky.get('cfg-pin|cfg:pin'), a = room.sticky.get('cfg-apkupd|cfg:apkupd');
-  res.json({ ok: true, pin: !!(p && p.data && p.data.on), apk: { on: !!(a && a.data && a.data.on), ver: Math.max(0, Math.floor(Number(a && a.data && a.data.ver) || 0)) } });
+  const f = room.sticky.get('cfg-drvphoto|cfg:drvphoto'), fd = (f && f.data) || {};   /* V622 · foto obligatoria / auto-moto / modelo */
+  res.json({ ok: true, pin: !!(p && p.data && p.data.on), apk: { on: !!(a && a.data && a.data.on), ver: Math.max(0, Math.floor(Number(a && a.data && a.data.ver) || 0)) }, drv: { photo: !!fd.on, vtc: !!fd.vtc, mdl: !!fd.mdl } });
 });
 /* V618 · aviso de app de Android nueva (solo se ve en el APK). Apagado de fábrica. */
 app.post('/api/admin/apkupd', (req, res) => {
