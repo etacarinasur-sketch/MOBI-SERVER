@@ -167,6 +167,10 @@ async function dbInit() {
     try { const at = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'admtok'`); for (const row of at.rows) if (row.data && row.data.t && Number(row.data.exp) > Date.now()) adminTokens.set(String(row.data.t), Number(row.data.exp)); db.query(`DELETE FROM mobi_kv WHERE ns = 'admtok' AND at < now() - interval '13 hours'`).catch(() => {}); } catch (e) { console.warn('admtok', e.message); }
     try { const tp = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'tpax' AND at > now() - interval '120 days'`); for (const row of tp.rows) if (row.data && row.data.h && !tripPax.has(row.id)) tripPax.set(row.id, row.data.h); } catch (e) { console.warn('tpax', e.message); }
     try { const wl = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'wel'`); for (const row of wl.rows) { const d = row.data; if (d && d.tk && !d.gone && (d.done || Date.now() - Number(d.at || 0) < WEL_HOLD_MS)) welRec.set(row.id, d); } } catch (e) { console.warn('wel', e.message); }   /* V576 */
+    try { const ic = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'inc' AND at > now() - interval '180 days'`); for (const row of ic.rows) { const d = row.data; if (d && d.room && d.id) { const l = incList({ name: d.room }); if (!l.some((x) => x.id === d.id)) l.push(d); } } for (const l of INC.mem.values()) { l.sort((a, b) => b.at - a.at); if (l.length > 300) l.length = 300; }
+      const sn = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'incsnap'`); for (const row of sn.rows) if (row.data && row.data.m) INC.snap.set(row.id, row.data);
+      const icf = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'inccfg' AND id = 'cfg'`); if (icf.rows[0] && icf.rows[0].data && Number(icf.rows[0].data.big) >= 1000) INC.big = Number(icf.rows[0].data.big); } catch (e) { console.warn('incidentes', e.message); }   /* V629 */
+    try { const er = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'erased'`); for (const row of er.rows) ERASED.set(row.id, Number(row.data && row.data.at) || 1); } catch (e) { console.warn('erased', e.message); }   /* V630 */
     try { const rr = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'remind'`); for (const row of rr.rows) if (row.data) remMem.set(row.id, row.data); } catch (e) { console.warn('remind', e.message); }   /* V576 */
     try { const ow = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'own'`); for (const row of ow.rows) if (row.data && row.data.h && !ownMap.has(row.id)) ownMap.set(row.id, row.data.h); } catch (e) { console.warn('own', e.message); }
     try { const mo = await db.query(`SELECT id, data FROM mobi_kv WHERE ns = 'mpord' AND at > now() - interval '60 days'`); for (const row of mo.rows) if (!mpOrders.has(row.id)) mpOrders.set(row.id, row.data); } catch (e) { console.warn('mpord', e.message); }
@@ -199,7 +203,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -323,6 +327,7 @@ function pushMessage(room, m) {
     if (pc) for (const c of msg.data.cars) { const o = pc.find((x) => x && c && String(x.plate || '') === String(c.plate || '')); const st = String((c && c.status) || '');
       if (o && (st === 'aprobado' || st === 'rechazado') && String(o.status || 'pendiente') !== st) { const mo = c.vtype === 'moto';
         pushNotify(String(msg.data.id || ''), st === 'aprobado' ? { title: mo ? '🏍️ ¡Tu moto fue aprobada!' : '🚗 ¡Tu auto fue aprobado!', body: 'Ya podés trabajar con ' + (c.model || 'tu vehículo') + '. Abrí MOBI y elegilo en «Trabajás con».' } : { title: mo ? 'Tu moto no fue aprobada' : 'Tu auto no fue aprobado', body: 'Revisá los datos y la documentación de ' + (c.model || 'tu vehículo') + ' en Configuración.' }); } } } } catch (e) {}
+  try { incWatch(room, msg); } catch (e) {}   /* V629 · incidentes de dinero (solo registra y avisa) */
   room.ring.push(msg);
   try { lpWake(room, LP_LOW.has(msg.type)); } catch (e) {}   /* V607 */
   if (room.ring.length > RING_MAX) room.ring.splice(0, room.ring.length - RING_MAX);
@@ -354,6 +359,7 @@ function staleReg(room, m) {
 }
 function regBlocked(room, m) {
   if (staleReg(room, m)) return true;
+  if (m && m.data && (m.type === 'pax-reg' || m.type === 'driver-reg') && ERASED.has(room.name + '|' + String(m.data.id || ''))) return true;   /* V630 · cuenta de prueba eliminada: no se vuelve a crear con el mismo id */
   if (!m || !m.data) return false;
   if (m.type === 'driver-reg' && m.data.status === 'pendiente') return !!findDupReg(room, 'driver-reg', m.data);
   if (m.type === 'pax-reg' && !room.sticky.has('pax-reg|' + (m.key || ''))) return !!findDupReg(room, 'pax-reg', m.data);
@@ -562,14 +568,14 @@ function guardMsg(room, m, auth) {
     }
     if (d.type !== 'credit') return null;
     /* saldo a favor: tiene que venir de un viaje real que hizo este conductor */
-    const k = String(d.tripKey || ''); if (!k) { console.log('Saldo a favor rechazado: sin viaje', drv, d.note || ''); return null; }
+    const k = String(d.tripKey || ''); if (!k) { console.log('Saldo a favor rechazado: sin viaje', drv, d.note || ''); incReject(room, d, 'saldo a favor sin viaje', 'Pidió saldo a favor sin un viaje asociado'); return null; }
     const tr = stickyData(room, 'trip|tr:' + k + ':drv'), cl = room.claims.get(k);
     const who = String((tr && tr.active && tr.active.driver && tr.active.driver.id) || (cl && cl.driverId) || '');
-    if (who !== drv) { console.log('Saldo a favor rechazado: el viaje no es de este conductor', drv, who || '-', k); return null; }
-    const kind = String(d.kind || ''), o = Object.assign({}, d); if (kind === 'welcome') return null;   /* V576 · ese saldo lo pone solo el servidor */
+    if (who !== drv) { console.log('Saldo a favor rechazado: el viaje no es de este conductor', drv, who || '-', k); incReject(room, d, 'saldo a favor de un viaje que no es suyo', who ? 'El viaje figura de otro conductor (' + who + ')' : 'El viaje no figura como suyo'); return null; }
+    const kind = String(d.kind || ''), o = Object.assign({}, d); if (kind === 'welcome') { incReject(room, d, 'saldo de viaje de bienvenida cargado desde el celular', 'Ese saldo solo lo pone el servidor'); return null; }   /* V576 · ese saldo lo pone solo el servidor */
     delete o.ver; delete o.hold; delete o.holdWhy; delete o.paxIdent; delete o.paxSk; delete o.releasedAt; o.at = Date.now();
     let n = 0, nc = 0; for (const x of room.sticky.values()) if (x && x.type === 'debt-charge' && x.data && x.data.type === 'credit' && String(x.data.tripKey || '') === k) { n++; if (isCancelCredit(x.data)) nc++; }
-    if (n >= 3) return null;
+    if (n >= 3) { incReject(room, d, 'más de 3 saldos a favor en el mismo viaje', ''); return null; }
     if (isCancelCredit(o)) {   /* V510 · cancelación: queda retenida hasta que MOBI le cobre el cargo al pasajero */
       if (nc >= 1) return null;                                     /* una sola por viaje */
       o.kind = 'cancel'; o.hold = true; o.holdWhy = 'cobro'; o.paxIdent = paxIdentOfTrip(room, k) || ''; o.paxSk = tripPax.get(room.name + '|' + k) || '';
@@ -577,7 +583,7 @@ function guardMsg(room, m, auth) {
     }
     if (kind === 'paxcredit') {   /* saldo a favor del pasajero usado: solo si lo tiene de verdad */
       const ident = paxIdentOfTrip(room, k), have = paxCreditOf(room, ident);
-      if (!(ident && have + 0.5 >= amt)) { o.hold = true; o.holdWhy = 'saldo'; }
+      if (!(ident && have + 0.5 >= amt)) { o.hold = true; o.holdWhy = 'saldo'; incAdd(room, { kind: 'frenado', title: 'Saldo a favor del pasajero que no tiene (quedó retenido)', drv, tk: k, amount: amt, dk: 'paxsaldo|' + drv + '|' + k, detail: 'El pasajero tiene ' + incMoney(have) + ' de saldo a favor en el servidor. No baja la deuda del conductor hasta que se revise.' }); }
       m.data = o; return m;
     }
     if (hasCardCredit(room, k)) return null;   /* V520 · un solo saldo con tarjeta por viaje (aunque ya lo haya registrado el servidor) */
@@ -606,13 +612,13 @@ function guardMsg(room, m, auth) {
       let np = 0, dup = false; for (const x of room.sticky.values()) { const y = x && x.type === 'debt-pay' && x.data; if (y && y.type === 'payout' && y.status === 'pendiente' && String(y.driver) === drv) { np++; if (Math.abs(Number(y.amount) - amt) < 0.01 && Date.now() - Number(y.at || 0) < 600_000) dup = true; } }
       if (np >= 3 || dup) { auth.why = { error: dup ? 'dup' : 'many' }; return null; }
       const L = ledgerOf(room, drv); o.status = 'pendiente'; delete o.flag; delete o.verified;
-      if (amt > L.avail + 0.5) { auth.why = { error: 'over', avail: L.avail }; return null; }   /* V510 · no puede pedir más que su saldo disponible */
+      if (amt > L.avail + 0.5) { auth.why = { error: 'over', avail: L.avail }; incReject(room, d, 'retiro mayor al saldo disponible', 'Pidió ' + incMoney(amt) + ' y tiene ' + incMoney(L.avail) + ' disponible'); return null; }   /* V510 · no puede pedir más que su saldo disponible */
       m.data = o; return m; }
     if (o.type !== 'payment') return null;
     if (o.status === 'confirmado') {
       const mo = mpOrders.get(String(o.mpOrderId || ''));
       if (mo && mo.ok && !mo.used && !mo.credited && Math.abs(Number(mo.amount) - amt) < 0.01 && (!mo.sk || mo.sk === auth.sk || ownHas(room, 'drv', drv, mo.sk))) {   /* V508 · el cobro solo lo puede acreditar el celular que pagó (o uno vinculado a la misma cuenta) */ mo.used = drv; kvSet('mpord', String(o.mpOrderId), mo); }
-      else { o.status = 'pendiente'; o.note = 'Sin confirmación de Mercado Pago: revisar'; }
+      else { o.status = 'pendiente'; o.note = 'Sin confirmación de Mercado Pago: revisar'; incAdd(room, { kind: 'frenado', title: 'Pago marcado como confirmado sin cobro real de Mercado Pago', drv, amount: amt, dk: 'pagosinmp|' + drv + '|' + id, detail: 'Quedó «pendiente» para revisar: no baja la deuda hasta que lo confirmes.' }); }
     } else o.status = 'pendiente';
     if (o.status !== 'confirmado') delete o.confirmedAt;
     m.data = o; return m;
@@ -724,7 +730,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -745,7 +751,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -804,7 +810,7 @@ function busHandle(req, res) {
     }
     if (!x.priv || all) { out.push(x); continue; }
     const set = r.parts.get(x.tk);
-    if (x.type === 'pay-proof' && !(set && set.has(me))) continue;   /* V470 · el comprobante nunca va a todos (el conductor lo baja de /api/proof/get) */
+    if ((x.type === 'pay-proof' || x.type === 'pay-proof-meta') && !(set && set.has(me))) continue;   /* V470 · el comprobante nunca va a todos (el conductor lo baja de /api/proof/get) · V629 · su ficha tampoco */
     if (!set || set.has(me)) { out.push(x); continue; }            // sin datos del viaje (p. ej. tras reinicio): se entrega como antes
     if (x.priv === 'trip') { const a = x.data.active; out.push({ id: x.id, type: x.type, src: x.src, key: x.key, ts: x.ts, at: x.at, data: { active: { tripKey: a.tripKey, status: a.status }, from: x.data.from, rev: x.data.rev, by: x.data.by } }); }
   }
@@ -2599,6 +2605,84 @@ app.post('/api/admin/erase', async (req, res) => {
   console.log('Cuenta eliminada · …' + tail.slice(-4), '· cuentas', accounts.length, '· documentos', plan.docs, '· avisos', plan.avisos);
   res.json({ ok: true, dry: false, found: true, done: true, plan, retained: 'viajes, pagos, comisiones, calificaciones y reportes' });
 });
+/* ===================== V630 · ELIMINAR CUENTA desde la ficha del buscador de Administración =====================
+   Siempre primero una VISTA PREVIA (dry) y después la confirmación. Dos modos:
+   · real  → igual que «Eliminar mi cuenta»: la cuenta, sus fotos y documentos, avisos y verificación. Se CONSERVAN sus viajes, pagos,
+             comisiones, calificaciones y reportes (registros contables).
+   · test  → cuenta de PRUEBA: además se borran sus viajes, cobros, pagos, comisiones, saldos e historial, para que no sumen en los totales.
+             Si el celular de prueba vuelve a mandar esa misma cuenta, no se vuelve a crear (tiene que reinstalar la app).
+   Al borrar se avisa a todos los celulares («acct-erased») para que la saquen de su memoria (la lista de Administración, los totales). */
+const ERASED = new Map();   // 'sala|id' -> fecha (solo modo prueba)
+const ER_TRIP_TYPES = new Set(['trip', 'trip-done', 'trip-end', 'rating', 'report', 'pay-proof', 'pay-proof-meta', 'pay-dispute', 'chat', 'driver-pos', 'pax-pos', 'approach-route', 'cancel', 'trip-abort', 'trip-close', 'refund-req']);
+function erTripKeyOf(m) {
+  const d = m && m.data; if (!d || typeof d !== 'object') return '';
+  const k = d.tripKey || d.tk || (d.active && d.active.tripKey) || (d.sum && d.sum.tripKey) || ''; if (k) return String(k);
+  const mm = /^tr:([^:]+):/.exec(String(m.key || '')); return mm ? mm[1] : '';
+}
+async function erasePlan(room, id, mode) {
+  const kind = id.startsWith('drv_') ? 'drv' : 'pax', regK = (kind === 'drv' ? 'driver-reg|dr:' : 'pax-reg|pr:') + id;
+  const reg = room.sticky.get(regK), d = (reg && reg.data) || {}, keys = new Set(), tks = new Set(), debtIds = [];
+  if (reg) keys.add(regK);
+  for (const [k, m] of room.sticky) if (m && ERASE_TYPES.has(m.type) && m.data && String(m.data.id || '') === id) keys.add(k);
+  const accounts = reg ? [{ role: kind === 'drv' ? 'conductor' : 'pasajero', name: String(d.name || '').trim(), status: String(d.status || ''), id }] : [];
+  let docIds = [];
+  if (kind === 'drv' && db) for (const pt of [id + '|%', 'car:' + id + ':%']) { try { const r = await db.query(`SELECT id FROM mobi_kv WHERE ns = 'doc' AND id LIKE $1`, [pt]); r.rows.forEach((x) => docIds.push(x.id)); } catch (e) { console.warn('borrar cuenta docs', e.message); } }
+  const memDocs = kind === 'drv' ? [...docMem.keys()].filter((k) => k.startsWith(id + '|') || k.startsWith('car:' + id + ':')) : [];
+  const subs = [...pushSubs.entries()].filter(([, x]) => x && (String(x.uid || '') === id || (Array.isArray(x.uids) && x.uids.includes(id))));
+  const ver = waVerified.has(id);
+  let movs = 0, money = 0; const histK = [], wel = [];
+  if (mode === 'test') {
+    if (kind === 'drv') {
+      for (const [k, m] of room.sticky) {
+        if (!m || !m.data) continue;
+        if ((m.type === 'debt-charge' || m.type === 'debt-pay') && String(m.data.driver || '') === id) { keys.add(k); movs++; if (m.data.id) debtIds.push(String(m.data.id)); if (m.data.tripKey) tks.add(String(m.data.tripKey));
+          const a = Number(m.data.amount) || 0; money += m.type === 'debt-charge' && m.data.type === 'charge' ? a : 0; }
+        else if (m.type === 'trip-done') { const it = ((Array.isArray(m.data.hist) ? m.data.hist : []).find((h) => h && h.role === 'drv') || {}).item || {}; if (String(it.driverId || (m.data.sum && m.data.sum.driverId) || '') === id) { const t = erTripKeyOf(m); if (t) tks.add(t); } }
+        else if (m.type === 'trip' && m.data.active && m.data.active.driver && String(m.data.active.driver.id || '') === id) { const t = erTripKeyOf(m); if (t) tks.add(t); }
+      }
+      for (const [k, c] of room.claims) if (c && String(c.driverId || '') === id) tks.add(String(k));
+      for (const [k, r] of welRec) if (r && String(r.drv || '') === id && k.startsWith(room.name + '|')) wel.push(k);
+      histK.push(HK(room, id));
+    } else {
+      for (const [k, sk] of tripPax) if (k.startsWith(room.name + '|') && paxIdentOfSk(room, sk) === 'pax:' + id) tks.add(k.slice(room.name.length + 1));
+      histK.push(HK(room, 'p:' + id));
+    }
+    for (const [k, m] of room.sticky) if (m && ER_TRIP_TYPES.has(m.type)) { const t = erTripKeyOf(m); if (t && tks.has(t)) keys.add(k); }
+    if (db && tks.size) for (const t of tks) for (const kd of ['proof', 'delivery']) docIds.push('trip_' + t + '|' + kd);
+  }
+  docIds = [...new Set(docIds)];
+  return { kind, reg, d, keys, tks, debtIds, docIds, memDocs, subs, ver, histK, wel,
+    plan: { mode, accounts, docs: new Set(docIds.filter((x) => !/^trip_/.test(x)).concat(memDocs)).size, avisos: subs.length, verificaciones: ver ? 1 : 0,
+      viajes: mode === 'test' ? tks.size : 0, movimientos: mode === 'test' ? movs : 0, comisiones: mode === 'test' ? Math.round(money) : 0,
+      retained: mode === 'test' ? '' : 'viajes, pagos, comisiones, calificaciones y reportes' } };
+}
+app.post('/api/admin/erase-acct', async (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const id = String(b.id || ''); if (!OWN_RE.pax.test(id) && !OWN_RE.drv.test(id)) return res.status(400).json({ ok: false, error: 'id' });
+  const mode = b.mode === 'test' ? 'test' : 'real', dry = b.dry !== false, room = getRoom(b.room);
+  const P = await erasePlan(room, id, mode);
+  if (!P.reg && !P.keys.size && !P.docIds.length && !P.subs.length && !P.ver) return res.json({ ok: true, dry, found: false, plan: P.plan });
+  if (dry) return res.json({ ok: true, dry: true, found: true, plan: P.plan });
+  const kill = P.keys;
+  for (const k of kill) { room.sticky.delete(k); dirtyDrop(room.name, k); if (db) { try { await db.query('DELETE FROM mobi_sticky WHERE room = $1 AND k = $2', [room.name, k]); } catch (e) { console.warn('borrar cuenta', e.message); } } }
+  for (let i = room.ring.length - 1; i >= 0; i--) { const x = room.ring[i]; if (x && x.key && kill.has(x.type + '|' + x.key)) room.ring.splice(i, 1); }
+  if (db) for (const di of P.docIds) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'doc' AND id = $1`, [di]); } catch (e) { console.warn('borrar cuenta docs', e.message); } }
+  P.memDocs.forEach((k) => docMem.delete(k)); P.docIds.forEach((k) => docMem.delete(k));
+  for (const [h] of P.subs) { pushSubs.delete(h); pushQueue.delete(h); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]); } catch (e) {} } }
+  if (P.ver) { waVerified.delete(id); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'wa' AND id = $1`, [id]); } catch (e) {} } }
+  { const fk = room.name + '|' + id; if (fbDone.delete(fk) && db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'fb' AND id = $1`, [fk]); } catch (e) {} } }
+  if (mode === 'test') {
+    for (const hk of P.histK) { dHist.delete(hk); dSess.delete(hk); dDirty.delete('dhist|' + hk); dDirty.delete('dsess|' + hk); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns IN ('dhist','dsess') AND id = $1`, [hk]); } catch (e) {} } }
+    for (const wk of P.wel) { welRec.delete(wk); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'wel' AND id = $1`, [wk]); } catch (e) {} } }
+    for (const t of P.tks) { room.claims.delete(t); room.parts.delete(t); }
+    try { const sn = INC.snap.get(room.name); if (sn && sn.m) { let ch = false; for (const k of kill) if (sn.m[k]) { delete sn.m[k]; ch = true; } if (ch) kvSet('incsnap', room.name, sn); } } catch (e) {}   /* lo borrado a propósito no es un «movimiento que desapareció» */
+    ERASED.set(room.name + '|' + id, Date.now()); kvSet('erased', room.name + '|' + id, { at: Date.now() });
+  }
+  try { finCache.delete(room.name); } catch (e) {}   /* los totales de Administración se recalculan ya */
+  pushMessage(room, { type: 'acct-erased', key: 'er:' + id, src: 'admin', data: { id, mode, at: Date.now(), debtIds: P.debtIds.slice(0, 2000), tks: [...P.tks].slice(0, 2000) } });
+  console.log('Cuenta eliminada desde la ficha ·', id, '· modo', mode, '· registros', kill.size, '· viajes', P.tks.size, '· movimientos', P.plan.movimientos);
+  res.json({ ok: true, dry: false, found: true, done: true, plan: P.plan });
+});
 function dirtyDrop(roomName, k) { try { dirty.delete(roomName + '\u0001' + k); } catch (e) {} try { dirtySlow.delete(roomName + '\u0001' + k); } catch (e) {} }
 
 /* ===================== V577 · AVISOS CON LA APP DE ANDROID CERRADA =====================
@@ -2891,6 +2975,145 @@ app.post('/api/account/find', async (req, res) => {
   console.log('Recuperar cuenta · …' + v.tail.slice(-4), 'vía ' + (v.via || '?'), pax ? 'pasajero' : '', drv ? 'conductor(' + String(drv.status || 'borrador') + ')' : '');
   res.json({ ok: true, pax, drv, drvDocs });
 });
+
+/* V629 · COMPROBANTES: recupera las fichas que se perdieron en reinicios anteriores.
+   La foto de cada comprobante siempre quedó guardada (docs «trip_<viaje>|proof»), pero su ficha (viaje, monto, pasajero) vivía solo en memoria.
+   Al arrancar, para cada foto sin ficha se arma una con los datos del viaje terminado y se guarda. Solo la ve Administración. */
+async function proofMetaRestore() {
+  if (!db) return; let rows = [];
+  try { rows = (await db.query(`SELECT id, data->>'at' AS at FROM mobi_kv WHERE ns = 'doc' AND id LIKE 'trip\_%|proof' AND at > now() - interval '180 days'`)).rows; } catch (e) { console.warn('comprobantes', e.message); return; }
+  if (!rows.length) return;
+  const done = new Map(); let main = null, mainN = -1;
+  for (const r of rooms.values()) { if (r.sticky.size > mainN) { main = r; mainN = r.sticky.size; }
+    for (const m of r.sticky.values()) if (m && m.type === 'trip-done' && m.data && m.data.tripKey) done.set(String(m.data.tripKey), { r, d: m.data }); }
+  let n = 0;
+  for (const row of rows) {
+    const k = String(row.id).replace(/^trip_/, '').replace(/\|proof$/, ''); if (!k) continue;
+    let has = false; for (const r of rooms.values()) if (r.sticky.has('pay-proof-meta|' + k)) { has = true; break; } if (has) continue;
+    const t = done.get(k), room = (t && t.r) || main; if (!room || /sbx|sandbox|test/i.test(room.name) && !t) continue;
+    const d = (t && t.d) || {}, it = ((Array.isArray(d.hist) ? d.hist : []).find((h) => h && h.role === 'drv') || {}).item || {}, sd = (d.sum && d.sum.driver) || {};
+    if (!room.parts.has(k)) room.parts.set(k, new Set());   /* sin participantes conocidos: solo la ve Administración */
+    pushMessage(room, { type: 'pay-proof-meta', key: k, src: 'srv', data: { tripKey: k, at: Number(row.at) || Number(it.at) || Date.now(), fare: Number(it.fare) || Number(d.sum && d.sum.fare) || 0, route: String(it.route || '').slice(0, 200), pax: 'Pasajero', driver: String(sd.name || '').slice(0, 80), plate: String(sd.plate || '').slice(0, 20), payment: String(it.payment || 'Transferencia').slice(0, 40), restored: 1 } });
+    n++;
+  }
+  if (n) console.log('Comprobantes: se recuperaron ' + n + ' fichas que se habían perdido en reinicios anteriores');
+}
+setTimeout(() => { proofMetaRestore().catch((e) => console.warn('comprobantes', e.message)); }, Number(process.env.PROOF_RESTORE_MS) || 20_000).unref();
+/* la lista completa de fichas para Administración (la app la pide al abrir: así no depende de haber estado conectada cuando llegó cada una) */
+app.post('/api/admin/proofs', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), list = [];
+  for (const m of room.sticky.values()) if (m && m.type === 'pay-proof-meta' && m.data && m.data.tripKey) list.push(m.data);
+  list.sort((x, y) => (Number(y.at) || 0) - (Number(x.at) || 0));
+  res.json({ ok: true, list: list.slice(0, 300) });
+});
+
+/* ===================== V629 · INCIDENTES DE DINERO (solo REPORTES: nunca frena viajes, pagos ni la app) =====================
+   Registra en Administración («🚨 Incidentes de dinero») y avisa por mail (agrupado: como mucho uno cada 15 min) cuando:
+   - un movimiento queda DUPLICADO (mismo viaje cobrado o acreditado dos veces, mismo pago de Mercado Pago dos veces);
+   - el servidor FRENA un intento sospechoso (saldo a favor sin viaje real, retiro mayor al saldo, saldo de pasajero que no tiene, pago «confirmado» sin Mercado Pago…);
+   - un solo movimiento es muy GRANDE (monto configurable, $100.000 de fábrica);
+   - un movimiento ya registrado vuelve con OTRO MONTO;
+   - CONTROL DIARIO: un movimiento que estaba ayer ya no está (borrado), o un pasajero usó más saldo a favor del que tenía.
+   Mail: INC_MAIL_TO (de fábrica gabrielmajorana@live.com). Las salas de prueba (sandbox/test) se registran pero no mandan mail. */
+const INC_MAIL_TO = String(process.env.INC_MAIL_TO || 'gabrielmajorana@live.com').trim();
+const INC_MAIL_GAP = Number(process.env.INC_MAIL_GAP_MS) || 15 * 60_000, INC_FIRST_WAIT = Number(process.env.INC_FIRST_WAIT_MS) || 2 * 60_000;
+const INC = { big: 100000, mem: new Map(), snap: new Map(), lastCheck: new Map(), queue: [], lastMail: 0, firstQ: 0, day: { d: '', n: 0 }, mailLog: [] };
+const incTest = (room) => /sbx|sandbox|test/i.test(String(room && room.name || ''));
+const incList = (room) => { let l = INC.mem.get(room.name); if (!l) { l = []; INC.mem.set(room.name, l); } return l; };
+const incMoney = (n) => '$' + Math.round(Number(n) || 0).toLocaleString('es-AR');
+function incDrvName(room, drv) { const d = drv && stickyData(room, 'driver-reg|dr:' + drv); return String((d && d.name) || '').trim(); }
+function incAdd(room, o) {
+  try {
+    const l = incList(room), now = Date.now(), dk = String(o.dk || (o.kind + '|' + (o.drv || '') + '|' + (o.tk || '') + '|' + (o.key || '')));
+    if (l.some((x) => x.dk === dk && now - x.at < 6 * 3600_000)) return null;   /* el mismo caso no se repite (reintentos del celular) */
+    const it = { id: 'i' + now.toString(36) + crypto.randomBytes(2).toString('hex'), at: now, room: room.name, dk, kind: String(o.kind || ''), title: String(o.title || 'Inconsistencia').slice(0, 120),
+      drv: String(o.drv || ''), who: String(o.who || incDrvName(room, o.drv) || ''), tk: String(o.tk || ''), key: String(o.key || ''),
+      amount: o.amount == null ? null : Math.round(Number(o.amount) * 100) / 100, before: o.before == null ? null : Math.round(Number(o.before) * 100) / 100, after: o.after == null ? null : Math.round(Number(o.after) * 100) / 100,
+      detail: String(o.detail || '').slice(0, 400), by: String(o.by || '').slice(0, 40), seen: false };
+    l.unshift(it); if (l.length > 300) l.length = 300;
+    kvSet('inc', room.name + '|' + it.id, it);
+    console.warn('INCIDENTE DE DINERO ·', room.name, '·', it.title, '·', it.who || it.drv || '-', it.amount != null ? incMoney(it.amount) : '', it.detail);
+    if (!incTest(room)) { INC.queue.push(it); if (!INC.firstQ) INC.firstQ = now; }
+    return it;
+  } catch (e) { console.warn('incidente', e.message); return null; }
+}
+/* lo llama pushMessage ANTES de guardar: compara con lo que ya había (no cambia nada del mensaje) */
+function incWatch(room, msg) {
+  const t = msg.type; if ((t !== 'debt-charge' && t !== 'debt-pay') || !msg.key || !msg.data || typeof msg.data !== 'object') return;
+  const d = msg.data, prev = room.sticky.get(t + '|' + msg.key), pd = prev && prev.data, amt = Number(d.amount) || 0, drv = String(d.driver || ''), tk = String(d.tripKey || '');
+  const what = t === 'debt-pay' ? (d.type === 'payout' ? 'retiro' : 'pago') : (d.type === 'credit' ? 'saldo a favor' : 'cobro');
+  if (pd && typeof pd === 'object') {
+    const pa = Number(pd.amount) || 0;
+    if (Math.abs(pa - amt) > 0.5 || String(pd.type || '') !== String(d.type || '')) incAdd(room, { kind: 'modif', title: 'Movimiento modificado: ' + what + ' con otro monto', drv, tk, key: msg.key, before: pa, after: amt, amount: amt - pa, by: msg.src, dk: 'modif|' + msg.key + '|' + amt,
+      detail: (pd.note ? '«' + String(pd.note).slice(0, 80) + '» · ' : '') + 'Antes ' + incMoney(pa) + ', ahora ' + incMoney(amt) + (msg.src === 'admin' ? ' (cambio hecho desde Administración o por el servidor)' : '') });
+    return;
+  }
+  if (amt > INC.big) incAdd(room, { kind: 'grande', title: 'Movimiento muy grande: ' + what, drv, tk, key: msg.key, amount: amt, by: msg.src, detail: (d.note ? '«' + String(d.note).slice(0, 80) + '» · ' : '') + 'Supera el tope de aviso de ' + incMoney(INC.big) });
+  if (tk) for (const x of room.sticky.values()) {
+    const y = x && x.type === t && x.key !== msg.key && x.data; if (!y || String(y.driver || '') !== drv || String(y.tripKey || '') !== tk || String(y.type || '') !== String(d.type || '')) continue;
+    let dup = false;
+    if (t === 'debt-charge' && d.type === 'charge') dup = /^Comisi[oó]n de viaje/i.test(String(d.note || '')) && /^Comisi[oó]n de viaje/i.test(String(y.note || ''));
+    else if (t === 'debt-charge' && d.type === 'credit') dup = String(y.kind || '') === String(d.kind || '') && Math.abs((Number(y.amount) || 0) - amt) < 0.5 && isCancelCredit(y) === isCancelCredit(d);
+    if (dup) { incAdd(room, { kind: 'dup', title: 'Movimiento duplicado: el mismo viaje con dos ' + (d.type === 'credit' ? 'saldos a favor' : 'comisiones'), drv, tk, key: msg.key, amount: amt, by: msg.src, dk: 'dup|' + drv + '|' + tk + '|' + d.type, detail: 'Ya existía ' + incMoney(y.amount) + ' para el mismo viaje. Quedaron los dos registrados.' }); break; }
+  }
+  if (t === 'debt-pay' && d.type === 'payment' && d.status === 'confirmado' && d.mpOrderId) for (const x of room.sticky.values()) {
+    const y = x && x.type === 'debt-pay' && x.key !== msg.key && x.data; if (!y || y.type !== 'payment' || y.status !== 'confirmado' || String(y.mpOrderId || '') !== String(d.mpOrderId)) continue;
+    incAdd(room, { kind: 'dup', title: 'Pago duplicado: el mismo cobro de Mercado Pago acreditado dos veces', drv, key: msg.key, amount: amt, by: msg.src, dk: 'duppay|' + d.mpOrderId, detail: 'Orden de Mercado Pago ' + String(d.mpOrderId).slice(0, 40) }); break;
+  }
+}
+/* lo llama guardMsg cuando FRENA algo sospechoso (el rechazo sigue igual que antes) */
+function incReject(room, d, title, detail) {
+  try { const drv = String((d && d.driver) || ''), tk = String((d && d.tripKey) || '');
+    incAdd(room, { kind: 'frenado', title: 'Intento frenado: ' + title, drv, tk, amount: Number(d && d.amount) || 0, dk: 'frenado|' + title + '|' + drv + '|' + tk + '|' + Math.round(Number(d && d.amount) || 0), detail: String(detail || '') + (d && d.note ? (detail ? ' · ' : '') + '«' + String(d.note).slice(0, 80) + '»' : '') + ' · No se registró: el servidor lo rechazó.' });
+  } catch (e) {}
+}
+/* control diario: lo que estaba y ya no está, y saldos de pasajero imposibles */
+function incCheck(room, why) {
+  if (!room || !room.sticky) return; const cur = {}, now = Date.now();
+  for (const [k, m] of room.sticky) if (m && (m.type === 'debt-charge' || m.type === 'debt-pay') && m.data) cur[k] = [Math.round((Number(m.data.amount) || 0) * 100) / 100, String(m.data.driver || ''), String(m.data.tripKey || ''), String(m.data.note || '').slice(0, 60)];
+  const snap = INC.snap.get(room.name);
+  if (snap && snap.m) {
+    const gone = Object.keys(snap.m).filter((k) => !cur[k]);
+    for (const k of gone.slice(0, 20)) { const s = snap.m[k]; incAdd(room, { kind: 'falta', title: 'Movimiento que desapareció', drv: s[1], tk: s[2], key: k, before: s[0], after: 0, amount: -s[0], dk: 'falta|' + k, detail: (s[3] ? '«' + s[3] + '» · ' : '') + 'Estaba en el control anterior (' + new Date(snap.at).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) + ') y ya no está.' }); }
+    if (gone.length > 20) incAdd(room, { kind: 'falta', title: 'Faltan ' + gone.length + ' movimientos', dk: 'faltan|' + snap.at, amount: -gone.reduce((a, k) => a + snap.m[k][0], 0), detail: 'Desaparecieron ' + gone.length + ' cobros/pagos desde el control anterior. Puede ser un problema de la base de datos.' });
+    for (const k of Object.keys(snap.m)) { const s = snap.m[k], c = cur[k]; if (c && Math.abs(c[0] - s[0]) > 0.5) incAdd(room, { kind: 'modif', title: 'Movimiento modificado (control diario)', drv: s[1], tk: s[2], key: k, before: s[0], after: c[0], amount: c[0] - s[0], dk: 'modif|' + k.split('|').slice(1).join('|') + '|' + c[0], detail: (s[3] ? '«' + s[3] + '» · ' : '') + 'Cambió de monto desde el control anterior.' }); }
+  }
+  try { const ids = new Set(); for (const m of room.sticky.values()) { const y = m && m.type === 'debt-charge' && m.data; if (y && y.tripKey && (isRefundCharge(y) || y.kind === 'paxcredit')) { const id = paxIdentOfTrip(room, String(y.tripKey)); if (id) ids.add(id); } }
+    for (const id of ids) { const c = paxCreditOf(room, id); if (c < -0.5) incAdd(room, { kind: 'paxneg', title: 'Pasajero usó más saldo a favor del que tenía', amount: c, after: c, dk: 'paxneg|' + id + '|' + Math.round(c), detail: 'Su saldo a favor calculado quedó en ' + incMoney(c) + '.' }); } } catch (e) {}
+  INC.snap.set(room.name, { at: now, m: cur }); INC.lastCheck.set(room.name, now); kvSet('incsnap', room.name, { at: now, m: cur });
+  if (why) console.log('Control de dinero', room.name, '·', Object.keys(cur).length, 'movimientos ·', why);
+}
+setInterval(() => { const now = Date.now(); for (const r of rooms.values()) { try { if (now - (INC.lastCheck.get(r.name) || 0) >= 24 * 3600_000) incCheck(r, 'diario'); } catch (e) { console.warn('control dinero', e.message); } } }, 60 * 60_000).unref();
+setTimeout(() => { for (const r of rooms.values()) { try { if (INC.snap.has(r.name)) incCheck(r, 'al arrancar'); } catch (e) {} } }, Number(process.env.INC_BOOT_MS) || 10 * 60_000).unref();   /* al arrancar: compara con el último control guardado */
+async function incMailTick() {
+  if (!INC.queue.length) return; const now = Date.now();
+  if (now - INC.firstQ < INC_FIRST_WAIT || now - INC.lastMail < INC_MAIL_GAP) return;
+  const day = new Date().toISOString().slice(0, 10); if (INC.day.d !== day) INC.day = { d: day, n: 0 }; if (INC.day.n >= 30) return;
+  const items = INC.queue.splice(0, 40); INC.firstQ = INC.queue.length ? now : 0; INC.lastMail = now; INC.day.n++;
+  const esc = (x) => String(x == null ? '' : x).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+  const hora = (t) => new Date(t).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const line = (i) => [i.title, i.who || i.drv ? 'Conductor: ' + (i.who || '') + (i.drv ? ' (' + i.drv + ')' : '') : '', i.amount != null ? 'Monto: ' + incMoney(i.amount) : '', i.before != null || i.after != null ? 'Antes: ' + incMoney(i.before) + ' → Después: ' + incMoney(i.after) : '', i.detail, 'Hora: ' + hora(i.at)].filter(Boolean);
+  const subject = '🚨 MOBI · ' + items.length + (items.length === 1 ? ' incidente de dinero' : ' incidentes de dinero');
+  const text = 'MOBI detectó ' + items.length + (items.length === 1 ? ' movimiento raro' : ' movimientos raros') + ' en la plata. Este aviso no frena nada: la app sigue funcionando normalmente.\n\n' + items.map((i, n) => (n + 1) + '. ' + line(i).join('\n   ')).join('\n\n') + '\n\nRevisalo en Administración → 🚨 Incidentes de dinero.';
+  const html = '<div style="font-family:Arial,sans-serif;font-size:14px;color:#10202a"><h2 style="margin:0 0 6px">🚨 Incidentes de dinero</h2><p style="margin:0 0 12px;color:#555">MOBI detectó ' + items.length + (items.length === 1 ? ' movimiento raro' : ' movimientos raros') + '. <b>Este aviso no frena nada</b>: la app sigue funcionando normalmente.</p>' +
+    items.map((i) => { const l = line(i); return '<div style="border:1px solid #e3e8eb;border-left:4px solid #e5484d;border-radius:8px;padding:10px 12px;margin:0 0 10px"><b>' + esc(l[0]) + '</b><br>' + l.slice(1).map(esc).join('<br>') + '</div>'; }).join('') +
+    '<p style="color:#555">Revisalo en <b>Administración → 🚨 Incidentes de dinero</b>.</p></div>';
+  if (process.env.INC_MAIL_DRY) { INC.mailLog.push({ at: now, to: INC_MAIL_TO, subject, text }); console.log('[mail de prueba] ' + subject + '\n' + text); return; }
+  if (!GM_ON || !INC_MAIL_TO) return;
+  try { await gmSend(INC_MAIL_TO, subject, html, text); console.log('Mail de incidentes enviado a', INC_MAIL_TO, '·', items.length); }
+  catch (e) { console.warn('mail incidentes', e.message); INC.queue.unshift(...items); INC.firstQ = now; }
+}
+setInterval(() => { incMailTick().catch(() => {}); }, Number(process.env.INC_TICK_MS) || 60_000).unref();
+app.post('/api/admin/incidents', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), l = incList(room);
+  if (b.seen) { for (const it of l) if (!it.seen && (b.seen === 'all' || it.id === b.seen)) { it.seen = true; it.seenAt = Date.now(); kvSet('inc', room.name + '|' + it.id, it); } }
+  if (b.big !== undefined) { const v = Math.round(Number(b.big)); if (v >= 1000 && v <= 100_000_000) { INC.big = v; kvSet('inccfg', 'cfg', { big: v }); } }
+  if (b.check) { try { incCheck(room, 'pedido desde Administración'); } catch (e) {} }
+  res.json({ ok: true, list: l.slice(0, 200), unseen: l.filter((x) => !x.seen).length, big: INC.big, mail: { on: GM_ON || !!process.env.INC_MAIL_DRY, to: INC_MAIL_TO, last: INC.lastMail, pending: INC.queue.length }, lastCheck: INC.lastCheck.get(room.name) || 0, testRoom: incTest(room) });
+});
+if (process.env.INC_MAIL_DRY) app.get('/api/admin/incmaillog', (req, res) => res.json({ ok: true, log: INC.mailLog, queue: INC.queue.length }));
 
 /* ---------------- limpieza: registros de pasajeros nunca verificados (90 días) ----------------
    Ley 25.326: los datos se guardan solo mientras hagan falta. Se borran los pasajeros que en 90 días
