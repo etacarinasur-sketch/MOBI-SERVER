@@ -2604,6 +2604,7 @@ app.post('/api/admin/erase', async (req, res) => {
   for (const [h] of subs) { pushSubs.delete(h); pushQueue.delete(h); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'push' AND id = $1`, [h]); } catch (e) { console.warn('erase push', e.message); } } }
   for (const [u] of vers) { waVerified.delete(u); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'wa' AND id = $1`, [u]); } catch (e) { console.warn('erase wa', e.message); } } }
   for (const id of ids) { const k = room.name + '|' + id; if (fbDone.delete(k) && db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'fb' AND id = $1`, [k]); } catch (e) { console.warn('erase fb', e.message); } } }   /* V586 */
+  for (const id of ids) { if (!OWN_RE.pax.test(id) && !OWN_RE.drv.test(id)) continue; ERASED.set(room.name + '|' + id, Date.now()); kvSet('erased', room.name + '|' + id, { at: Date.now() }); pushMessage(room, { type: 'acct-erased', key: 'er:' + id, src: 'admin', data: { id, mode: 'real', at: Date.now(), debtIds: [], tks: [] } }); }   /* V635 · el celular cierra la sesión y no la vuelve a crear */
   console.log('Cuenta eliminada · …' + tail.slice(-4), '· cuentas', accounts.length, '· documentos', plan.docs, '· avisos', plan.avisos);
   res.json({ ok: true, dry: false, found: true, done: true, plan, retained: 'viajes, pagos, comisiones, calificaciones y reportes' });
 });
@@ -2678,8 +2679,8 @@ app.post('/api/admin/erase-acct', async (req, res) => {
     for (const wk of P.wel) { welRec.delete(wk); if (db) { try { await db.query(`DELETE FROM mobi_kv WHERE ns = 'wel' AND id = $1`, [wk]); } catch (e) {} } }
     for (const t of P.tks) { room.claims.delete(t); room.parts.delete(t); }
     try { const sn = INC.snap.get(room.name); if (sn && sn.m) { let ch = false; for (const k of kill) if (sn.m[k]) { delete sn.m[k]; ch = true; } if (ch) kvSet('incsnap', room.name, sn); } } catch (e) {}   /* lo borrado a propósito no es un «movimiento que desapareció» */
-    ERASED.set(room.name + '|' + id, Date.now()); kvSet('erased', room.name + '|' + id, { at: Date.now() });
   }
+  ERASED.set(room.name + '|' + id, Date.now()); kvSet('erased', room.name + '|' + id, { at: Date.now() });   /* V635 · en los dos modos: el celular no la vuelve a crear */
   try { finCache.delete(room.name); } catch (e) {}   /* los totales de Administración se recalculan ya */
   pushMessage(room, { type: 'acct-erased', key: 'er:' + id, src: 'admin', data: { id, mode, at: Date.now(), debtIds: P.debtIds.slice(0, 2000), tks: [...P.tks].slice(0, 2000) } });
   console.log('Cuenta eliminada desde la ficha ·', id, '· modo', mode, '· registros', kill.size, '· viajes', P.tks.size, '· movimientos', P.plan.movimientos);
