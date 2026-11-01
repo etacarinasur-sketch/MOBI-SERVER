@@ -199,7 +199,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch']);   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -311,6 +311,7 @@ function pushMessage(room, m) {
   try { if ((msg.type === 'trip-done' || msg.type === 'trip-end') && welRec.size) welIngest(room, msg); } catch (e) {}   /* V576 · viajes de bienvenida */   /* V485 · historial de conductores (viajes y conexiones) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
   if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
+  try { twNote(room, msg); } catch (e) {}   /* V623 · última señal del conductor de cada viaje */
   /* V576 · el administrador aprobó o rechazó la cuenta del conductor: aviso con la app cerrada, con su mensaje */
   try { if (msg.type === 'driver-reg' && msg.key && msg.data) {   /* solo el administrador puede pasar una cuenta a aprobada o rechazada */
     const pv0 = room.sticky.get('driver-reg|' + msg.key), ps = String((pv0 && pv0.data && pv0.data.status) || ''), ns = String(msg.data.status || '');
@@ -723,7 +724,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -744,7 +745,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -2526,6 +2527,37 @@ app.post('/api/admin/apkupd', (req, res) => {
   if (b.ver !== undefined) { const v = Math.max(0, Math.min(1e7, Math.floor(Number(b.ver) || 0))); if (b.auto ? v > ver : v !== ver) { ver = v; ch = true; } }
   if (ch) { pushMessage(room, { type: 'cfg-apkupd', key: 'cfg:apkupd', src: 'admin', data: { on, ver, at: Date.now() } }); console.log('Aviso de app nueva', on ? 'ACTIVADO' : 'desactivado', '· versión de referencia', ver); }
   res.json({ ok: true, on, ver });
+});
+/* V623 · VIAJE SIN RESPUESTA DEL CONDUCTOR: el servidor anota la última señal del conductor de cada viaje (ubicación o avance del viaje)
+   y si el viaje terminó o se canceló. La app del pasajero lo consulta mientras espera. Apagado de fábrica (cfg-tripwatch). */
+const TW_BOOT = Date.now(), TW_MIN_MS = Math.max(1000, Number(process.env.TW_MINUTE_MS) || 60000);   /* TW_MINUTE_MS solo para pruebas */
+function twNote(room, msg) {
+  const d = msg && msg.data; if (!d || typeof d !== 'object') return;
+  if (!room.tw) room.tw = { seen: new Map(), end: new Map() };
+  const now = Date.now(), tw = room.tw;
+  let tk = '';
+  if (msg.type === 'driver-pos' && d.tripKey) tk = String(d.tripKey);
+  else if (msg.type === 'trip' && d.from === 'drv' && d.active && d.active.tripKey) tk = String(d.active.tripKey);
+  if (tk) { tw.seen.set(tk, now); if (tw.seen.size > 3000) tw.seen.delete(tw.seen.keys().next().value); }
+  if ((msg.type === 'trip-done' || msg.type === 'trip-end') && (d.tripKey || (d.sum && d.sum.tripKey))) { tw.end.set(String(d.tripKey || d.sum.tripKey), now); if (tw.end.size > 3000) tw.end.delete(tw.end.keys().next().value); }
+}
+function twCfg(room) { const m = room.sticky.get('cfg-tripwatch|cfg:tripwatch'), d = (m && m.data) || {}; const min = [5, 10, 15].includes(Number(d.min)) ? Number(d.min) : 10; return { on: !!d.on, min }; }
+app.post('/api/admin/tripwatch', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room), c = twCfg(room); let ch = false;
+  if (b.on !== undefined) { c.on = !!b.on; ch = true; }
+  if (b.min !== undefined && [5, 10, 15].includes(Number(b.min))) { c.min = Number(b.min); ch = true; }
+  if (ch) { pushMessage(room, { type: 'cfg-tripwatch', key: 'cfg:tripwatch', src: 'admin', data: { on: c.on, min: c.min, at: Date.now() } }); console.log('Aviso de conductor sin respuesta', c.on ? 'ACTIVADO' : 'desactivado', c.min, 'min'); }
+  res.json({ ok: true, on: c.on, min: c.min });
+});
+app.get('/api/trip/alive', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const room = getRoom(req.query.room), c = twCfg(room); if (!c.on) return res.json({ ok: true, on: false });
+  const tk = String(req.query.tk || '').slice(0, 80), drv = String(req.query.drv || '').slice(0, 60); if (!tk) return res.status(400).json({ ok: false });
+  const tw = room.tw || { seen: new Map(), end: new Map() }, now = Date.now();
+  /* sin datos (por ejemplo, el servidor se reinició) se cuenta desde el arranque: nunca da una falsa alarma */
+  const last = Math.max(tw.seen.get(tk) || 0, (drv && room.seen && room.seen.get(drv)) || 0, TW_BOOT);
+  res.json({ ok: true, on: true, min: c.min, ended: tw.end.has(tk), silentMin: Math.floor((now - last) / TW_MIN_MS) });
 });
 const ERASE_TYPES = new Set(['pax-reg', 'driver-reg', 'pax-chg', 'drv-chg', 'seller-reg']);
 app.post('/api/admin/erase', async (req, res) => {
