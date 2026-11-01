@@ -872,6 +872,8 @@ app.post('/api/trip/claim', (req, res) => {
     if (!au.admin && (!isOwner(r, 'drv', d, au.sk, legacyBind(r, 'drv', d)) || !dr || dr.status !== 'aprobado' || drvHidden(dr) || dr.deletedAt)) return res.json({ ok: false, error: 'not_approved' }); }
   const cur = r.claims.get(k);
   if (cur && cur.driverId !== d) return res.json({ ok: false, winner: cur.driverId });
+  /* V625 · viajes de bienvenida: cada conductor puede tomar como mucho WEL_DRV_DAY por día (los que hizo + los que tiene en curso) */
+  if (!cur) { try { const wr = welRec.get(r.name + '|' + k); if (wr && !wr.done && !wr.end && welDrvToday(r, d, k) >= WEL_DRV_DAY) return res.json({ ok: false, error: 'wel_limit', max: WEL_DRV_DAY }); } catch (e) {} }
   r.claims.set(k, { driverId: d, at: Date.now() });
   /* V470 · quién tomó cada viaje se guarda en la base EN SEGUNDO PLANO (no frena a nadie) y se recupera si el servidor se reinicia */
   if (db && !cur) db.query(`INSERT INTO mobi_kv (ns, id, data, at) VALUES ('claim', $1, $2::jsonb, now()) ON CONFLICT (ns, id) DO UPDATE SET data = EXCLUDED.data, at = now()`, [r.name + '|' + k, JSON.stringify({ driverId: d, at: Date.now() })]).catch(() => {});
@@ -2664,7 +2666,17 @@ setInterval(() => { const now = Date.now(); for (const [h, x] of pushSubs) if (x
    Los activa el administrador (apagado = la app funciona exactamente igual que antes).
    Pasajero: 3 viajes gratis por persona (DNI y celular), de hasta 3 km, directos, 1 por día, dentro de los 30 días desde el primero.
    Solo para quien todavía no hizo ningún viaje. Cuenta recién cuando el viaje TERMINA (si se cancela, no se pierde). */
-const WEL_MAX = 3, WEL_KM = 3, WEL_DAYS = 30, WEL_HOLD_MS = 3 * 3600_000;
+const WEL_MAX = 3, WEL_KM = 3, WEL_DAYS = 30, WEL_HOLD_MS = 3 * 3600_000, WEL_DRV_DAY = 2;   /* V625 · máximo de viajes de bienvenida por conductor por día */
+function welDrvToday(room, drv, skipTk) {
+  const today = welDay(Date.now()), now = Date.now(); let n = 0;
+  for (const r of welOf(room)) {
+    if (!r || r.tk === skipTk) continue;
+    if (r.done) { if (!r.self && String(r.drv || '') === drv && welDay(r.done) === today) n++; continue; }
+    const cl = room.claims && room.claims.get(String(r.tk));
+    if (welLive(r, now) && cl && cl.driverId === drv && welDay(cl.at || r.at) === today) n++;
+  }
+  return n;
+}
 const welRec = new Map();   // 'sala|tripKey' -> { tk, pax, keys, at, val, km, vk, end, done, drv, self }
 function welCfg(room) { const m = room.sticky.get('cfg-welcome|cfg:welcome'), d = m && m.data; return { on: !!(d && d.on), cap: Math.max(0, Math.round(Number(d && d.cap) || 0)), max: welMaxOf(d), at: Number(d && d.at) || 0 }; }
 /* V577d · cantidad de viajes de bienvenida por pasajero: la elige el administrador (1 a 3). Sin elegir = 3, como antes */
