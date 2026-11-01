@@ -314,6 +314,7 @@ function pushMessage(room, m) {
   try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}
   try { if ((msg.type === 'trip-done' || msg.type === 'trip-end') && welRec.size) welIngest(room, msg); } catch (e) {}   /* V576 · viajes de bienvenida */   /* V485 · historial de conductores (viajes y conexiones) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
+  try { supNotify(room, msg); } catch (e) {}   /* V633 · aviso por mail cuando alguien escribe a Soporte */
   if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
   try { twNote(room, msg); } catch (e) {}   /* V623 · última señal del conductor de cada viaje */
   /* V576 · el administrador aprobó o rechazó la cuenta del conductor: aviso con la app cerrada, con su mensaje */
@@ -3009,6 +3010,40 @@ app.post('/api/admin/proofs', (req, res) => {
   res.json({ ok: true, list: list.slice(0, 300) });
 });
 
+/* V633 · MAIL CUANDO ALGUIEN ESCRIBE A SOPORTE: cada mensaje nuevo que manda un pasajero o conductor desde «Soporte»
+   (no las respuestas de Administración). A SUP_NOTIFY_TO (de fábrica el mismo mail de los incidentes). Como mucho 1 mail por consulta cada 10 min
+   (si escribe varios seguidos van juntos en el próximo) y 80 por día. Las salas de prueba no mandan mail. */
+const SUP = { last: new Map(), pend: new Map(), day: { d: '', n: 0 }, log: [] };
+function supNotify(room, msg) {
+  if (msg.type !== 'report' || !msg.key || !msg.data || typeof msg.data !== 'object') return;
+  const d = msg.data; if (!d.sup || d.from !== 'u' || d.kind === 'resolve') return;
+  if (room.sticky.has('report|' + msg.key)) return;   /* ya estaba: no es un mensaje nuevo */
+  if (/sbx|sandbox|test/i.test(room.name)) return;
+  const tid = String(d.tid || msg.key), k = room.name + '|' + tid, l = SUP.pend.get(k) || [];
+  l.push({ at: Date.now(), name: String(d.name || '').slice(0, 80), role: d.role === 'drv' ? 'Conductor' : 'Pasajero', phone: String(d.phone || '').slice(0, 30), plate: String(d.plate || '').slice(0, 20), why: String(d.rlabel || d.reason || '').slice(0, 80), text: String(d.text || '').slice(0, 1500), tid });
+  SUP.pend.set(k, l.slice(-10));
+}
+async function supTick() {
+  const now = Date.now(), to = String(process.env.SUP_NOTIFY_TO || INC_MAIL_TO || '').trim();
+  for (const [k, l] of [...SUP.pend]) {
+    if (!l.length || now - (SUP.last.get(k) || 0) < 10 * 60_000) continue;
+    const day = new Date().toISOString().slice(0, 10); if (SUP.day.d !== day) SUP.day = { d: day, n: 0 }; if (SUP.day.n >= 80) return;
+    SUP.pend.delete(k); SUP.last.set(k, now); SUP.day.n++;
+    const f = l[l.length - 1], esc = (x) => String(x == null ? '' : x).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    const hora = (t) => new Date(t).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    const subject = '🎧 MOBI Soporte · ' + (f.name || f.role) + (f.why ? ' · ' + f.why : '');
+    const head = [f.role + ': ' + (f.name || 'sin nombre'), f.phone ? 'Celular: ' + f.phone : '', f.plate ? 'Patente: ' + f.plate : '', f.why ? 'Motivo: ' + f.why : '', 'Consulta N.º ' + f.tid].filter(Boolean);
+    const text = 'Nuevo mensaje en Soporte de MOBI.\n\n' + head.join('\n') + '\n\n' + l.map((m) => '[' + hora(m.at) + '] ' + m.text).join('\n\n') + '\n\nRespondé desde Administración → 🎧 Soporte.';
+    const html = '<div style="font-family:Arial,sans-serif;font-size:14px;color:#10202a"><h2 style="margin:0 0 6px">🎧 Nuevo mensaje en Soporte</h2><p style="margin:0 0 10px;color:#555">' + head.map(esc).join('<br>') + '</p>' +
+      l.map((m) => '<div style="border:1px solid #e3e8eb;border-left:4px solid #20c997;border-radius:8px;padding:10px 12px;margin:0 0 8px"><small style="color:#777">' + esc(hora(m.at)) + '</small><br>' + esc(m.text).replace(/\n/g, '<br>') + '</div>').join('') +
+      '<p style="color:#555">Respondé desde <b>Administración → 🎧 Soporte</b>.</p></div>';
+    if (process.env.INC_MAIL_DRY) { SUP.log.push({ at: now, to, subject, text }); console.log('[mail de prueba] ' + subject); continue; }
+    if (!GM_ON || !to) continue;
+    try { await gmSend(to, subject, html, text); console.log('Mail de Soporte enviado a', to, '·', f.tid); } catch (e) { console.warn('mail soporte', e.message); SUP.pend.set(k, l); SUP.last.delete(k); }
+  }
+}
+setInterval(() => { supTick().catch(() => {}); }, Number(process.env.INC_TICK_MS) || 60_000).unref();
+if (process.env.INC_MAIL_DRY) app.get('/api/admin/supmaillog', (req, res) => res.json({ ok: true, log: SUP.log }));
 /* ===================== V629 · INCIDENTES DE DINERO (solo REPORTES: nunca frena viajes, pagos ni la app) =====================
    Registra en Administración («🚨 Incidentes de dinero») y avisa por mail (agrupado: como mucho uno cada 15 min) cuando:
    - un movimiento queda DUPLICADO (mismo viaje cobrado o acreditado dos veces, mismo pago de Mercado Pago dos veces);
