@@ -203,7 +203,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-wshare', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-wshare', 'cfg-selftrip', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -731,7 +731,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-selftrip' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -752,7 +752,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-selftrip' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -1886,19 +1886,32 @@ app.post('/api/admin/founder-set', (req, res) => {
    Se guarda aparte de los mensajes del bus (que se limpian a los 3 días): un registro corto por viaje y por sesión conectada. */
 const dHist = new Map(), dSess = new Map(), dDirty = new Set();
 const HK = (room, id) => (typeof room === 'string' ? room : room.name) + '|' + String(id);
+/* V642 · AUTOVIAJES: viaje donde el conductor y el pasajero son la misma persona (mismo DNI o mismo teléfono, o el mismo celular dueño de las dos cuentas).
+   Con el interruptor encendido no cuentan para nada: ni estadísticas, ni viaje de bienvenida, ni premios. No se bloquea el viaje ni se toca el cobro. */
+function selfOn(room) { const m = room.sticky.get('cfg-selftrip|cfg:selftrip'); return !!(m && m.data && m.data.on); }
+function selfPair(room, drvId, paxId, paxSk) {
+  try {
+    drvId = String(drvId || ''); paxId = String(paxId || '');
+    if (drvId && paxSk && ownHas(room, 'drv', drvId, paxSk)) return true;
+    if (!drvId || !paxId) return false;
+    const dk = welKeys(stickyData(room, 'driver-reg|dr:' + drvId)), pk = welKeys(stickyData(room, 'pax-reg|pr:' + paxId));
+    return dk.some((x) => pk.includes(x));
+  } catch (e) { return false; }
+}
 function histIngest(room, msg) {
   const d = msg.data; if (!d || !Array.isArray(d.hist)) return;
   const it = (d.hist.find((h) => h && h.role === 'drv') || {}).item; if (!it || !it.driverId) return;
   const k = HK(room, it.driverId), l = dHist.get(k) || [], id = String((d.ledger && d.ledger.tripId) || it.id || '');
+  const tsk0 = d.tripKey ? tripPax.get(room.name + '|' + String(d.tripKey)) || '' : '', idt0 = tsk0 ? paxIdentOfSk(room, tsk0) : '', self0 = selfOn(room) && selfPair(room, it.driverId, idt0.startsWith('pax:') ? idt0.slice(4) : '', tsk0);
   if (!id || l.some((x) => x.id === id)) return;
-  l.push({ id, at: Number(it.at) || Date.now(), route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), fare: Number(it.fare) || 0, net: Number(it.net) || 0, fee: Number(it.fee) || 0, payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), pax: String(it.other || '').slice(0, 60), plate: String((d.ledger && d.ledger.plate) || it.plate || '').slice(0, 12) });
+  l.push({ id, at: Number(it.at) || Date.now(), route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), fare: Number(it.fare) || 0, net: Number(it.net) || 0, fee: Number(it.fee) || 0, payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), pax: String(it.other || '').slice(0, 60), plate: String((d.ledger && d.ledger.plate) || it.plate || '').slice(0, 12), self: self0 ? true : undefined });
   if (l.length > 1500) l.splice(0, l.length - 1500);
   dHist.set(k, l); dDirty.add('dhist|' + k);
   /* V495 · viajes por pasajero (para el buscador de Administración) */
   /* V513 · el pasajero real del viaje sale de quién pidió el viaje (antes se tomaba un dato del celular del conductor) */
   const tsk = d.tripKey ? tripPax.get(room.name + '|' + String(d.tripKey)) || '' : '', idt = tsk ? paxIdentOfSk(room, tsk) : '';
   const pid = idt.startsWith('pax:') ? idt.slice(4) : (tsk ? 'sk:' + tsk : '');   /* V516 · sin saber quién pidió el viaje no se anota (antes caía en el pasajero del celular del conductor) */
-  if (pid) { const pk = HK(room, 'p:' + pid), pl = dHist.get(pk) || []; if (!pl.some((x) => x.id === id)) { const sd = (d.sum && d.sum.driver) || {}; pl.push({ id, at: Number(it.at) || Date.now(), fare: Number(it.fare) || 0, route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), drvName: String(sd.name || '').slice(0, 60), plate: String(sd.plate || (d.ledger && d.ledger.plate) || '').slice(0, 12), driverId: String(it.driverId || '') }); if (pl.length > 1500) pl.splice(0, pl.length - 1500); dHist.set(pk, pl); dDirty.add('dhist|' + pk); } }
+  if (pid) { const pk = HK(room, 'p:' + pid), pl = dHist.get(pk) || []; if (!pl.some((x) => x.id === id)) { const sd = (d.sum && d.sum.driver) || {}; pl.push({ id, at: Number(it.at) || Date.now(), fare: Number(it.fare) || 0, route: String(it.route || '').slice(0, 200), stop: String(it.stop || '').slice(0, 120), payment: String(it.payment || '').slice(0, 30), status: String(it.status || '').slice(0, 30), drvName: String(sd.name || '').slice(0, 60), plate: String(sd.plate || (d.ledger && d.ledger.plate) || '').slice(0, 12), driverId: String(it.driverId || ''), self: self0 ? true : undefined }); if (pl.length > 1500) pl.splice(0, pl.length - 1500); dHist.set(pk, pl); dDirty.add('dhist|' + pk); } }
 }
 function presIngest(room, msg) {
   const d = msg.data; if (!d || !d.id) return;
@@ -2011,9 +2024,9 @@ app.post('/api/admin/user-stats', (req, res) => {
   const ids = (a) => (Array.isArray(a) ? a : []).map((x) => String(x || '')).filter(Boolean).slice(0, 2000);
   const seenT = new Set();
   const add = (kind, id, tid, at) => { const o = out[kind][id] || (out[kind][id] = { trips: 0, last: 0 }); o.trips++; if (at > o.last) o.last = at; seenT.add(kind + '|' + id + '|' + tid); };
-  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) if (!x.bad) add('drv', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) if (!x.bad && !x.self) add('drv', id, x.id, Number(x.at) || 0);
   for (const id of ids(bd.drv)) { try { const L = ledgerOf(r, id), o = out.drv[id] || (out.drv[id] = { trips: 0, last: 0 }); o.debt = L.debt; o.favor = L.favor; o.charges = Math.round(L.charges * 100) / 100; } catch (e) {} }   /* V632 · la deuda de la ficha = la que calcula el servidor (la misma que ve el conductor) */
-  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) if (!x.bad) add('pax', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) if (!x.bad && !x.self) add('pax', id, x.id, Number(x.at) || 0);
   const wantD = new Set(ids(bd.drv)), wantP = new Set(ids(bd.pax));
   for (const m of r.sticky.values()) {   /* viajes que todavía están en el bus y no se anotaron */
     if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist)) continue;
@@ -2467,6 +2480,14 @@ app.post('/api/admin/wshare', (req, res) => {
   const m = room.sticky.get('cfg-wshare|cfg:wshare'), d = m && m.data;
   res.json({ ok: true, on: !!(d && d.on) });
 });
+/* V642 · «Autoviajes no cuentan» (interruptor, apagado de fábrica) */
+app.post('/api/admin/selftrip', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room);
+  if (b.on !== undefined) pushMessage(room, { type: 'cfg-selftrip', key: 'cfg:selftrip', src: 'admin', data: { on: !!b.on, at: Date.now() } });
+  const m = room.sticky.get('cfg-selftrip|cfg:selftrip'), d = m && m.data;
+  res.json({ ok: true, on: !!(d && d.on) });
+});
 /* V589 · recordatorio «verificá tu cuenta» (interruptor, apagado de fábrica): la app muestra el aviso a quien no verificó teléfono o mail */
 app.post('/api/admin/vrem', (req, res) => {
   const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
@@ -2786,7 +2807,7 @@ function welPaidBefore(room, paxId, until, skip) {   /* ¿ya hizo algún viaje n
   for (const m of room.sticky.values()) {
     if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist) || Number(m.at || 0) >= until) continue;
     if (skip.has(String(m.data.tripKey || ''))) continue;
-    if (m.data.hist.some((h) => h && h.item && String(h.item.paxId || '') === paxId)) return true;
+    if (m.data.hist.some((h) => h && h.item && String(h.item.paxId || '') === paxId && !(selfOn(room) && selfPair(room, h.item.driverId, paxId, '')))) return true;   /* V642 · un autoviaje no cuenta como viaje hecho */
   }
   return false;
 }
