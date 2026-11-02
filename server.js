@@ -3239,6 +3239,14 @@ app.post('/api/admin/note', async (req, res) => {
   console.log('Mensaje directo', kind, all || ids.join(','), '→', sent, 'con aviso al celular');
   res.json({ ok: true, id: note.id, people, sent });
 });
+/* V640 · borrar un mensaje directo ya enviado: deja de llegarle a quien todavía no lo leyó */
+app.post('/api/admin/note-del', (req, res) => {
+  const b = req.body || {};
+  if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), l = noteList(r.name), i = l.findIndex((n) => n.id === String(b.id || ''));
+  if (i >= 0) { l.splice(i, 1); noteSave(r.name); }
+  res.json({ ok: true, deleted: i >= 0 });
+});
 app.post('/api/admin/note-list', (req, res) => {
   const b = req.body || {};
   if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
