@@ -203,7 +203,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-wshare', 'cfg-selftrip', 'cfg-voice', 'cfg-xstreet', 'cfg-tripsave', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'pax-adj', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-wshare', 'cfg-selftrip', 'cfg-voice', 'cfg-xstreet', 'cfg-tripsave', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -488,7 +488,7 @@ function guardMsg(room, m, auth) {
   const t = m.type, d = m.data;
   const FLEX = t === 'seller-reg' || t === 'flex-pkg' || t === 'flex-run' || t === 'flex-cfg';
   if (FLEX) return guardFlex(room, m, auth);
-  const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'drv-chg';
+  const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'pax-adj' || t === 'drv-chg';
   if (!SENS) return m;
   if (!d || typeof d !== 'object') return null;
   if (auth.admin) {
@@ -499,6 +499,7 @@ function guardMsg(room, m, auth) {
     }
     return m;
   }
+  if (t === 'pax-adj') return null;   /* V682 · los ajustes de saldo de pasajeros solo los manda el administrador */
   if (auth.tried) return null;   /* clave de administrador vencida: no se toma como un celular común (no se apropia de cuentas) */
   if (t === 'driver-reg') {
     const id = String(d.id || ''); if (!OWN_RE.drv.test(id)) return null;
@@ -707,6 +708,7 @@ function viewFor(room, x, auth) {
   if (!d || typeof d !== 'object') return x;
   if (t === 'pax-reg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'pax-chg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
+  if (t === 'pax-adj') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'driver-reg') {
     if (ownHas(room, 'drv', String(d.id || ''), auth.sk)) return x;
     const o = {}; DRV_PUBLIC.forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; });
@@ -1585,6 +1587,70 @@ app.post('/api/admin/finance', (req, res) => {
   for (const k of Object.keys(byKind)) byKind[k].amt = Math.round(byKind[k].amt);
   const r2 = (n) => Math.round(n * 100) / 100, d = { ok: true, at: Date.now(), vol: r2(vol), fee: r2(fee), trips, owed: r2(owed), paid: r2(paid), drivers: drivers.size, audit: { byKind, rows: rows.slice(0, 40), dup: dup.slice(0, 20), dupN: dup.length } };
   finCache.set(room.name, { t: Date.now(), d }); res.json(d);
+});
+/* V682 · Administrador de balances: ver, anular y cargar movimientos de plata de conductores y ajustar pasajeros. Todo queda en un registro. */
+const balLog = [];
+function balNote(rec) { rec.at = Date.now(); balLog.unshift(rec); if (balLog.length > 300) balLog.pop(); try { kvSet('balog', 'b' + rec.at + Math.random().toString(36).slice(2, 5), rec); } catch (e) {} console.log('Balance admin:', rec.action, rec.driver || rec.pax || '', rec.amount || '', rec.reason || ''); }
+app.post('/api/admin/balance', async (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token)) return res.status(401).json({ ok: false, error: 'admin' });
+  const r = getRoom(b.room), act = String(b.action || ''), r0 = (n) => Math.round(n * 100) / 100;
+  const reason = String(b.reason || '').trim().slice(0, 200);
+  const nameOf = (id) => { const d = stickyData(r, 'driver-reg|dr:' + id); return d ? { name: String(d.name || ''), plate: String(d.plate || ''), phone: String(d.phone || '') } : { name: '', plate: '', phone: '' }; };
+  try {
+    if (act === 'drivers') {
+      const ids = new Set();
+      for (const x of r.sticky.values()) { if (x && x.type === 'driver-reg' && x.data && OWN_RE.drv.test(String(x.data.id || ''))) ids.add(String(x.data.id)); else if (x && (x.type === 'debt-charge' || x.type === 'debt-pay') && x.data && OWN_RE.drv.test(String(x.data.driver || ''))) ids.add(String(x.data.driver)); }
+      const q = String(b.q || '').toLowerCase().trim(), out = [];
+      for (const id of ids) { const n = nameOf(id), L = ledgerOf(r, id); if (q && !(id.toLowerCase().includes(q) || n.name.toLowerCase().includes(q) || n.plate.toLowerCase().includes(q))) continue; out.push({ id, name: n.name, plate: n.plate, debt: L.debt, favor: L.favor, n: L.list.length }); }
+      out.sort((x, y) => (y.debt + y.favor) - (x.debt + x.favor) || x.name.localeCompare(y.name));
+      return res.json({ ok: true, drivers: out.slice(0, 60) });
+    }
+    if (act === 'entries') {
+      const drv = String(b.driver || ''); if (!OWN_RE.drv.test(drv)) return res.status(400).json({ ok: false, error: 'datos' });
+      const L = ledgerOf(r, drv), n = nameOf(drv);
+      return res.json({ ok: true, driver: drv, name: n.name, plate: n.plate, charges: r0(L.charges), paid: r0(L.paid), cred: r0(L.cred), payDone: r0(L.payDone), held: L.held, debt: L.debt, favor: L.favor, list: L.list.slice(-80).reverse().map((y) => ({ id: y.id, type: y.type, kind: y.kind || '', amount: Number(y.amount) || 0, at: y.at, note: String(y.note || '').slice(0, 140), hold: !!y.hold, status: y.status || '', voided: !!y.voidAt })) });
+    }
+    if (act === 'void') {
+      const drv = String(b.driver || ''), id = String(b.id || ''); if (!OWN_RE.drv.test(drv) || !id) return res.status(400).json({ ok: false, error: 'datos' });
+      if (reason.length < 3) return res.status(400).json({ ok: false, error: 'motivo' });
+      let hit = null; for (const x of r.sticky.values()) if (x && (x.type === 'debt-charge' || x.type === 'debt-pay') && x.data && String(x.data.id) === id && String(x.data.driver) === drv) { hit = x; break; }
+      if (!hit) return res.status(404).json({ ok: false, error: 'no_existe' });
+      const d = hit.data, amt = Number(d.amount) || 0; if (d.voidAt) return res.json({ ok: true, already: true });
+      pushMessage(r, { type: hit.type, key: hit.key, src: 'admin', data: Object.assign({}, d, { amount: 0, hold: false, voidAt: Date.now(), voidedAmt: amt, voidReason: reason, note: '🗑 Anulado por Administración · ' + String(d.note || '').slice(0, 100) }) });
+      balNote({ action: 'void', driver: drv, id, amount: amt, type: d.type, reason, note: String(d.note || '').slice(0, 80) });
+      return res.json({ ok: true });
+    }
+    if (act === 'add') {
+      const drv = String(b.driver || ''), typ = b.type === 'charge' ? 'charge' : 'credit', amt = Math.round(Number(b.amount) || 0);
+      if (!OWN_RE.drv.test(drv) || !(amt > 0) || amt > 5_000_000) return res.status(400).json({ ok: false, error: 'datos' });
+      if (reason.length < 3) return res.status(400).json({ ok: false, error: 'motivo' });
+      const id = 'adj' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+      pushMessage(r, { type: 'debt-charge', key: 'dc:' + id, src: 'admin', data: { id, type: typ, kind: 'admin-adj', amount: amt, at: Date.now(), driver: drv, note: (typ === 'credit' ? 'Saldo a favor cargado por Administración · ' : 'Deuda cargada por Administración · ') + reason, srv: 1 } });
+      balNote({ action: typ === 'credit' ? 'add-credit' : 'add-charge', driver: drv, id, amount: amt, reason });
+      return res.json({ ok: true, id });
+    }
+    if (act === 'pax') {
+      const q = String(b.q || '').toLowerCase().trim(), qd = q.replace(/\D/g, ''), out = [];
+      for (const x of r.sticky.values()) { const d = x && x.type === 'pax-reg' && x.data; if (!d || !OWN_RE.pax.test(String(d.id || '')) || d.deletedAt) continue; const nm = String(d.name || ''), ph = String(d.phone || '').replace(/\D/g, ''); if (q && !(nm.toLowerCase().includes(q) || (qd.length >= 3 && ph.includes(qd)) || String(d.id).includes(q))) continue; out.push({ id: String(d.id), name: nm, phone: String(d.phone || '') }); }
+      return res.json({ ok: true, pax: out.slice(0, 30) });
+    }
+    if (act === 'paxadj') {
+      const pid = String(b.pax || ''), what = String(b.what || ''); if (!OWN_RE.pax.test(pid) || !['clearFee', 'clearCredit', 'addCredit'].includes(what)) return res.status(400).json({ ok: false, error: 'datos' });
+      const amt = Math.round(Number(b.amount) || 0); if (what === 'addCredit' && !(amt > 0 && amt <= 5_000_000)) return res.status(400).json({ ok: false, error: 'datos' });
+      if (reason.length < 3) return res.status(400).json({ ok: false, error: 'motivo' });
+      const id = 'pa' + Date.now().toString(36) + Math.random().toString(36).slice(2, 4);
+      pushMessage(r, { type: 'pax-adj', key: 'pa:' + pid + ':' + id, src: 'admin', data: { id: pid, aid: id, what, amount: amt, reason, at: Date.now() } });
+      balNote({ action: 'pax-' + what, pax: pid, amount: amt, reason });
+      return res.json({ ok: true, aid: id });
+    }
+    if (act === 'log') {
+      let rows = balLog.slice();
+      if (db) { try { const q = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'balog'`); rows = q.rows.map((x) => x.data).filter(Boolean); } catch (e) {} }
+      rows.sort((x, y) => Number(y.at || 0) - Number(x.at || 0));
+      return res.json({ ok: true, log: rows.slice(0, 60) });
+    }
+  } catch (e) { console.warn('balance', e.message); return res.status(500).json({ ok: false, error: 'server' }); }
+  res.status(400).json({ ok: false, error: 'accion' });
 });
 /* V510 · el administrador libera a mano un saldo retenido (por ejemplo, un cobro con tarjeta que no se pudo comprobar solo) */
 app.post('/api/admin/release', (req, res) => {
