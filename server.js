@@ -2024,9 +2024,9 @@ app.post('/api/admin/user-stats', (req, res) => {
   const ids = (a) => (Array.isArray(a) ? a : []).map((x) => String(x || '')).filter(Boolean).slice(0, 2000);
   const seenT = new Set();
   const add = (kind, id, tid, at) => { const o = out[kind][id] || (out[kind][id] = { trips: 0, last: 0 }); o.trips++; if (at > o.last) o.last = at; seenT.add(kind + '|' + id + '|' + tid); };
-  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) if (!x.bad && !x.self) add('drv', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.drv)) for (const x of (dHist.get(HK(r, id)) || [])) { if (x.bad || x.self) seenT.add('drv|' + id + '|' + x.id); else add('drv', id, x.id, Number(x.at) || 0); }   /* V661 · el viaje salteado (autoviaje/anulado) se marca visto: así no se vuelve a sumar desde el bus */
   for (const id of ids(bd.drv)) { try { const L = ledgerOf(r, id), o = out.drv[id] || (out.drv[id] = { trips: 0, last: 0 }); o.debt = L.debt; o.favor = L.favor; o.charges = Math.round(L.charges * 100) / 100; } catch (e) {} }   /* V632 · la deuda de la ficha = la que calcula el servidor (la misma que ve el conductor) */
-  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) if (!x.bad && !x.self) add('pax', id, x.id, Number(x.at) || 0);
+  for (const id of ids(bd.pax)) for (const x of (dHist.get(HK(r, 'p:' + id)) || [])) { if (x.bad || x.self) seenT.add('pax|' + id + '|' + x.id); else add('pax', id, x.id, Number(x.at) || 0); }
   const wantD = new Set(ids(bd.drv)), wantP = new Set(ids(bd.pax));
   for (const m of r.sticky.values()) {   /* viajes que todavía están en el bus y no se anotaron */
     if (!m || m.type !== 'trip-done' || !m.data || !Array.isArray(m.data.hist)) continue;
