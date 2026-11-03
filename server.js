@@ -898,7 +898,9 @@ app.get('/api/trip/state', (req, res) => {
   const te = r.sticky.get('trip-end|te:' + k), tp = stickyData(r, 'trip|tr:' + k + ':pax'), td = stickyData(r, 'trip|tr:' + k + ':drv');
   const pa = (tp && tp.active) || null, da = (td && td.active) || null;
   const ended = !!(te || r.doneTk.has(k) || (pa && /Cancel/i.test(String(pa.status || ''))));
-  res.json({ ok: true, ended, drv: !ended && da && String(da.tripKey || '') === k ? da : null });
+  let done = null;   /* V679 · si el viaje terminó bien, se devuelve su resumen para que el pasajero lo pueda cerrar como corresponde (calificar, saldar cargos) */
+  if (ended && r.doneTk.has(k)) { for (const x of r.sticky.values()) if (x && x.type === 'trip-done' && x.data && String(x.data.tripKey || '') === k) { done = { type: 'trip-done', data: x.data, src: x.src || 'srv' }; break; } }
+  res.json({ ok: true, ended, done, drv: !ended && da && String(da.tripKey || '') === k ? da : null });
 });
 app.post('/api/trip/release', (req, res) => {
   const { room, tripKey, driverId } = req.body || {};
