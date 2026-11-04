@@ -203,7 +203,7 @@ async function dbInit() {
 }
 /* qué se guarda: solo lo que importa conservar. Las ubicaciones GPS cambian todo el tiempo y quedan en memoria
    (así la base "duerme" cuando no hay actividad y no se gastan las horas gratis). El viaje en curso se guarda cada 20 s. */
-const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'pax-adj', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-wshare', 'cfg-selftrip', 'cfg-voice', 'cfg-xstreet', 'cfg-tripsave', 'cfg-fb', 'cfg-vrem', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
+const DURABLE = new Set(['pax-reg', 'driver-reg', 'debt-charge', 'debt-pay', 'rating', 'report', 'trip-end', 'trip-done', 'acct-susp', 'pax-chg', 'pax-adj', 'cfg-price', 'cfg-debt', 'cfg-cupo', 'drv-slots', 'cfg-founder', 'drv-founders', 'refund-req', 'cfg-push', 'cfg-maint', 'cfg-prelaunch', 'cfg-reset', 'drv-chg', 'seller-reg', 'flex-pkg', 'flex-run', 'flex-cfg', 'cfg-welcome', 'cfg-remind', 'cfg-natpush', 'cfg-drvphoto', 'cfg-delacct', 'cfg-wshare', 'cfg-selftrip', 'cfg-voice', 'cfg-xstreet', 'cfg-tripsave', 'cfg-fb', 'cfg-vrem', 'cfg-wallet', 'pax-wallet', 'cfg-pin', 'cfg-apkupd', 'cfg-tripwatch', 'pay-proof-meta', 'acct-erased']);   /* V629 · la ficha de cada comprobante se guarda en la base (antes se perdía al reiniciar) */   /* V558 · MOBI Flex (vendedores) · V576 viajes de bienvenida */
 const dirtySlow = new Map();
 function persistSticky(roomName, k, msg) {
   if (!db) return;
@@ -437,6 +437,23 @@ function sibVia(room, kind, o) {
   } catch (e) {}
   return '';
 }
+/* V684 · billetera del pasajero en el servidor: { id, fee:{id,amount,km,at,tripKey,why,appliedTo,appliedAt}|null, credit:{amount,at,why,refund,tripKey,driver}|null, at }.
+   Es una COPIA de respaldo del teléfono; no cambia ningún cobro. Se restaura en un celular nuevo solo si el administrador enciende «Restaurar billetera». */
+function walletClean(id, d) {
+  const n = (x, mx) => Math.max(0, Math.min(mx || 5000000, Math.round(Number(x) || 0))), t = (x, l) => String(x == null ? '' : x).slice(0, l || 60);
+  const f = d && d.fee && typeof d.fee === 'object' && n(d.fee.amount) > 0 ? d.fee : null, c = d && d.credit && typeof d.credit === 'object' && n(d.credit.amount) > 0 ? d.credit : null;
+  return {
+    id,
+    fee: f ? { id: t(f.id, 40), amount: n(f.amount), km: Math.max(0, Math.min(500, Number(f.km) || 0)), at: n(f.at, 9e15), tripKey: t(f.tripKey), why: t(f.why, 40), appliedTo: f.appliedTo ? t(f.appliedTo) : undefined, appliedAt: f.appliedAt ? n(f.appliedAt, 9e15) : undefined } : null,
+    credit: c ? { amount: n(c.amount), at: n(c.at, 9e15), why: t(c.why, 40), refund: c.refund ? 1 : undefined, tripKey: t(c.tripKey), driver: t(c.driver) } : null,
+    at: Date.now()
+  };
+}
+function walletOn(room) { const m = room.sticky.get('cfg-wallet|cfg:wallet'), d = m && m.data; return !!(d && d.on); }
+function walletSet(room, pid, fn) {   /* el administrador corrige la copia del servidor (aunque el celular ya no esté) */
+  const m = room.sticky.get('pax-wallet|pw:' + pid), cur = walletClean(pid, (m && m.data) || {}), nx = fn(cur) || cur; nx.id = pid;
+  pushMessage(room, { type: 'pax-wallet', key: 'pw:' + pid, src: 'admin', data: Object.assign(walletClean(pid, nx), { adm: 1 }) });
+}
 const ADMIN_ONLY_DRV = ['reviewedAt', 'approvedAt', 'approvedSig', 'reason', 'hiddenAt', 'deletedAt'];
 const LOCK_APPROVED_DRV = ['name', 'dni', 'plate', 'vehicle', 'vtype', 'docSig', 'docs', 'registeredAt', 'submittedAt', 'submittedSig'];   /* V555 · el tipo (auto/moto) de un aprobado solo cambia con revisión */
 /* V555 · el celular no se cambia, salvo que el guardado esté incompleto (menos de 10 números) y el nuevo esté completo */
@@ -517,7 +534,7 @@ function guardMsg(room, m, auth) {
   const t = m.type, d = m.data;
   const FLEX = t === 'seller-reg' || t === 'flex-pkg' || t === 'flex-run' || t === 'flex-cfg';
   if (FLEX) return guardFlex(room, m, auth);
-  const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'pax-adj' || t === 'drv-chg';
+  const SENS = t === 'driver-reg' || t === 'pax-reg' || t === 'debt-charge' || t === 'debt-pay' || t === 'pax-chg' || t === 'pax-adj' || t === 'pax-wallet' || t === 'drv-chg';
   if (!SENS) return m;
   if (!d || typeof d !== 'object') return null;
   if (auth.admin) {
@@ -527,6 +544,11 @@ function guardMsg(room, m, auth) {
       if (fee > 0) m.data = Object.assign({}, d, { mpFee: fee, amount: Math.round((a0 - fee) * 100) / 100, note: String(d.note || 'Viaje cobrado por MOBI (tarjeta)') + ' · menos comisión de Mercado Pago ($' + Math.round(fee) + ')' });
     }
     return m;
+  }
+  if (t === 'pax-wallet') {   /* V684 · copia en el servidor del cargo pendiente y del saldo a favor del pasajero (solo el dueño de la cuenta) */
+    const id = String(d.id || ''); if (!OWN_RE.pax.test(id)) return null;
+    if (!isOwner(room, 'pax', id, auth.sk, false)) return null;
+    m.key = 'pw:' + id; m.data = walletClean(id, d); return m;
   }
   if (t === 'pax-adj') return null;   /* V682 · los ajustes de saldo de pasajeros solo los manda el administrador */
   if (auth.tried) return null;   /* clave de administrador vencida: no se toma como un celular común (no se apropia de cuentas) */
@@ -738,6 +760,7 @@ function viewFor(room, x, auth) {
   if (t === 'pax-reg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'pax-chg') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'pax-adj') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
+  if (t === 'pax-wallet') return ownHas(room, 'pax', String(d.id || ''), auth.sk) ? x : null;
   if (t === 'driver-reg') {
     if (ownHas(room, 'drv', String(d.id || ''), auth.sk)) return x;
     const o = {}; DRV_PUBLIC.forEach((k) => { if (d[k] !== undefined) o[k] = d[k]; });
@@ -762,7 +785,7 @@ app.post('/api/bus/batch', (req, res) => {
   for (const m0 of messages.slice(0, 100)) {
     const m = guardMsg(r, m0, auth); if (!m) { if (notOwnerMsg(r, m0, auth)) denied++; continue; }
     if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(r, String(m.data.active.tripKey), auth.sk);   /* V510 · quién es el pasajero de cada viaje */   /* V500 · seguridad */
-    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-selftrip' || m.type === 'cfg-voice' || m.type === 'cfg-xstreet' || m.type === 'cfg-tripsave' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased')) continue;   // solo el administrador (endpoint propio)
+    if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-selftrip' || m.type === 'cfg-voice' || m.type === 'cfg-xstreet' || m.type === 'cfg-tripsave' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-wallet' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased')) continue;   // solo el administrador (endpoint propio)
     if (regBlocked(r, m)) continue;               // registro doble en el mismo rol
     if (m && m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))) continue;
     if (m && m.type === 'trip' && m.data && m.data.active) {
@@ -783,7 +806,7 @@ app.post('/api/bus', (req, res) => {
   if (!m && au0.why) return res.status(409).json(Object.assign({ ok: false }, au0.why));
   if (!m) return res.status(403).json({ ok: false, error: 'forbidden', notOwner: notOwnerMsg(getRoom(room), m0, au0) });
   if (m.type === 'trip' && m.data && m.data.from === 'pax' && m.data.active && m.data.active.tripKey) tripPaxSet(getRoom(room), String(m.data.active.tripKey), au0.sk);
-  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-selftrip' || m.type === 'cfg-voice' || m.type === 'cfg-xstreet' || m.type === 'cfg-tripsave' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
+  if (m && (m.type === 'acct-susp' || m.type === 'cfg-price' || m.type === 'cfg-debt' || m.type === 'cfg-maint' || m.type === 'cfg-prelaunch' || m.type === 'cfg-reset' || m.type === 'cfg-cupo' || m.type === 'cfg-push' || m.type === 'drv-slots' || m.type === 'cfg-founder' || m.type === 'drv-founders' || m.type === 'cfg-welcome' || m.type === 'cfg-remind' || m.type === 'cfg-natpush' || m.type === 'cfg-drvphoto' || m.type === 'cfg-delacct' || m.type === 'cfg-wshare' || m.type === 'cfg-selftrip' || m.type === 'cfg-voice' || m.type === 'cfg-xstreet' || m.type === 'cfg-tripsave' || m.type === 'cfg-fb' || m.type === 'cfg-vrem' || m.type === 'cfg-wallet' || m.type === 'cfg-pin' || m.type === 'cfg-apkupd' || m.type === 'cfg-tripwatch' || m.type === 'acct-erased' || (m.type === 'pax-chg' && !(m.data && (m.data.status === 'pendiente' || m.data.status === 'cancelado'))))) return res.status(403).json({ ok: false, error: 'admin' });
   if (regBlocked(getRoom(room), m)) return res.status(409).json({ ok: false, error: 'dup_reg' });
   const saved = pushMessage(getRoom(room), m);
   if (!saved) return res.status(400).json({ ok: false, error: 'invalid message' });
@@ -1660,7 +1683,7 @@ app.post('/api/admin/balance', async (req, res) => {
     }
     if (act === 'pax') {
       const q = String(b.q || '').toLowerCase().trim(), qd = q.replace(/\D/g, ''), out = [];
-      for (const x of r.sticky.values()) { const d = x && x.type === 'pax-reg' && x.data; if (!d || !OWN_RE.pax.test(String(d.id || '')) || d.deletedAt) continue; const nm = String(d.name || ''), ph = String(d.phone || '').replace(/\D/g, ''); if (q && !(nm.toLowerCase().includes(q) || (qd.length >= 3 && ph.includes(qd)) || String(d.id).includes(q))) continue; out.push({ id: String(d.id), name: nm, phone: String(d.phone || '') }); }
+      for (const x of r.sticky.values()) { const d = x && x.type === 'pax-reg' && x.data; if (!d || !OWN_RE.pax.test(String(d.id || '')) || d.deletedAt) continue; const nm = String(d.name || ''), ph = String(d.phone || '').replace(/\D/g, ''); if (q && !(nm.toLowerCase().includes(q) || (qd.length >= 3 && ph.includes(qd)) || String(d.id).includes(q))) continue; const wm = r.sticky.get('pax-wallet|pw:' + d.id), wd = wm && wm.data; out.push({ id: String(d.id), name: nm, phone: String(d.phone || ''), fee: wd && wd.fee ? Number(wd.fee.amount) || 0 : 0, credit: wd && wd.credit ? Number(wd.credit.amount) || 0 : 0 }); }
       return res.json({ ok: true, pax: out.slice(0, 30) });
     }
     if (act === 'paxadj') {
@@ -1669,6 +1692,7 @@ app.post('/api/admin/balance', async (req, res) => {
       if (reason.length < 3) return res.status(400).json({ ok: false, error: 'motivo' });
       const id = 'pa' + Date.now().toString(36) + Math.random().toString(36).slice(2, 4);
       pushMessage(r, { type: 'pax-adj', key: 'pa:' + pid + ':' + id, src: 'admin', data: { id: pid, aid: id, what, amount: amt, reason, at: Date.now() } });
+      try { walletSet(r, pid, (w) => { if (what === 'clearFee') w.fee = null; else if (what === 'clearCredit') w.credit = null; else w.credit = { amount: (w.credit ? w.credit.amount : 0) + amt, at: Date.now(), why: 'admin' }; return w; }); } catch (e) { console.warn('wallet adj', e.message); }
       balNote({ action: 'pax-' + what, pax: pid, amount: amt, reason });
       return res.json({ ok: true, aid: id });
     }
@@ -2621,6 +2645,13 @@ app.post('/api/admin/tripsave', (req, res) => {
   const room = getRoom(b.room);
   if (b.on !== undefined) pushMessage(room, { type: 'cfg-tripsave', key: 'cfg:tripsave', src: 'admin', data: { on: !!b.on, at: Date.now() } });
   res.json({ ok: true, on: tripSaveOn(room) });
+});
+/* V684 · billetera del pasajero: interruptor «Restaurar en un celular nuevo» (apagado de fábrica) */
+app.post('/api/admin/wallet', (req, res) => {
+  const b = req.body || {}; if (!adminOk(b.token) && !sbxOk(b)) return res.status(401).json({ ok: false, error: 'admin' });
+  const room = getRoom(b.room);
+  if (b.on !== undefined) { pushMessage(room, { type: 'cfg-wallet', key: 'cfg:wallet', src: 'admin', data: { on: !!b.on, at: Date.now() } }); console.log('Restaurar billetera del pasajero', b.on ? 'ACTIVADO' : 'desactivado'); }
+  res.json({ ok: true, on: walletOn(room) });
 });
 /* V589 · recordatorio «verificá tu cuenta» (interruptor, apagado de fábrica): la app muestra el aviso a quien no verificó teléfono o mail */
 app.post('/api/admin/vrem', (req, res) => {
