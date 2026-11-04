@@ -408,6 +408,35 @@ function legacyBind(room, kind, id) { return !ownGet(room, kind, id) && !!sticky
 function stickyData(room, k) { const m = room.sticky.get(k); return (m && m.data && typeof m.data === 'object') ? m.data : null; }
 function waViaFor(id, phone) { const v = waVerified.get(String(id || '')); return v && v.tail && v.tail === tail8(phone) ? (v.via || 'wa') : ''; }   /* V530 · por dónde verificó: wa / tg / mail */
 function waOkFor(id, phone) { const v = waVerified.get(String(id || '')); return !!(v && v.tail && v.tail === tail8(phone)); }
+/* V683 · misma persona = misma verificación: si el conductor ya verificó (mismo celular y mismo DNI; si fue por mail, el mismo mail), su cuenta de pasajero queda verificada, y al revés.
+   Solo LEE lo ya verificado; nunca crea una verificación nueva. Si algo falla, devuelve '' (queda como antes). */
+const sibCache = new Map();
+function sibList(room) {
+  const hit = sibCache.get(room.name); if (hit && Date.now() - hit.t < 5000) return hit.l;
+  const l = [];
+  try {
+    for (const [k, m] of room.sticky) {
+      const kind = k.startsWith('driver-reg|dr:') ? 'drv' : k.startsWith('pax-reg|pr:') ? 'pax' : ''; if (!kind) continue;
+      const d = m && m.data; if (!d || typeof d !== 'object' || !d.id || d.deletedAt) continue;
+      const via = waViaFor(d.id, d.phone); if (!via) continue;
+      const v = waVerified.get(String(d.id)) || {};
+      l.push({ kind, id: String(d.id), tail: tail8(d.phone), dni: String(d.dni || '').replace(/\D/g, ''), email: String(v.email || '').trim().toLowerCase(), via });
+    }
+  } catch (e) { return []; }
+  sibCache.set(room.name, { t: Date.now(), l }); return l;
+}
+function sibVia(room, kind, o) {
+  try {
+    const tl = tail8(o && o.phone), dni = String(o && o.dni || '').replace(/\D/g, ''), em = String(o && o.email || '').trim().toLowerCase();
+    if (!tl || tl.length < 8 || dni.length < 6) return '';
+    for (const e of sibList(room)) {
+      if (e.kind === kind || e.id === String(o.id) || e.tail !== tl || e.dni !== dni) continue;
+      if (e.via === 'mail' && (!e.email || e.email !== em)) continue;
+      return e.via;
+    }
+  } catch (e) {}
+  return '';
+}
 const ADMIN_ONLY_DRV = ['reviewedAt', 'approvedAt', 'approvedSig', 'reason', 'hiddenAt', 'deletedAt'];
 const LOCK_APPROVED_DRV = ['name', 'dni', 'plate', 'vehicle', 'vtype', 'docSig', 'docs', 'registeredAt', 'submittedAt', 'submittedSig'];   /* V555 · el tipo (auto/moto) de un aprobado solo cambia con revisión */
 /* V555 · el celular no se cambia, salvo que el guardado esté incompleto (menos de 10 números) y el nuevo esté completo */
@@ -520,7 +549,7 @@ function guardMsg(room, m, auth) {
         if (Array.isArray(o.cars)) o.cars = o.cars.slice(0, 6).map((c) => { const old = pc.find((x) => x && c && String(x.plate || '') === String(c.plate || '')); return Object.assign({}, c, { status: old ? old.status : 'pendiente' }); });
       }
     } else { ADMIN_ONLY_DRV.forEach((k) => delete o[k]); }
-    o.wa = waOkFor(id, o.phone); o.waVia = o.wa ? waViaFor(id, o.phone) : '';
+    o.wa = waOkFor(id, o.phone); o.waVia = o.wa ? waViaFor(id, o.phone) : ''; if (!o.wa) { const sv = sibVia(room, 'drv', o); if (sv) { o.wa = true; o.waVia = sv; } }
     if (revOn(o.phone) && (o.status === 'pendiente' || o.status === 'aprobado')) {   /* V584 · conductor de prueba del revisor: aprobado al instante, con su auto */
       const now = Date.now(); o.status = 'aprobado'; o.approvedAt = (prev && prev.approvedAt) || now; o.reviewedAt = (prev && prev.reviewedAt) || now; o.revisor = 1;
       if (Array.isArray(o.cars)) o.cars = o.cars.map((c) => Object.assign({}, c, { status: 'aprobado' }));
@@ -540,7 +569,7 @@ function guardMsg(room, m, auth) {
       if (String(prev.photo || '')) o.photo = prev.photo;                                                  /* la foto de perfil, una vez cargada, no se cambia */
       ['deletedAt'].forEach((k) => { if (prev[k] === undefined) delete o[k]; else o[k] = prev[k]; });
     }
-    o.wa = waOkFor(id, o.phone); o.waVia = o.wa ? waViaFor(id, o.phone) : '';
+    o.wa = waOkFor(id, o.phone); o.waVia = o.wa ? waViaFor(id, o.phone) : ''; if (!o.wa) { const sv = sibVia(room, 'pax', o); if (sv) { o.wa = true; o.waVia = sv; } }
     m.data = o; return m;
   }
   if (t === 'pax-chg') {
@@ -701,7 +730,7 @@ function flexView(room, x, auth) {
 /* qué ve cada celular de los datos de otros */
 const DRV_PUBLIC = ['id', 'name', 'status', 'plate', 'vehicle', 'registeredAt', 'submittedAt', 'reviewedAt', 'approvedAt', 'updatedAt', 'hiddenAt', 'deletedAt', 'wa', 'docs'];
 function viewFor(room, x, auth) {
-  if (auth.admin) { const d0 = x && x.data; if (x && (x.type === 'pax-reg' || x.type === 'driver-reg') && d0 && d0.wa && !d0.waVia) { const via = waViaFor(d0.id, d0.phone); if (via) return Object.assign({}, x, { data: Object.assign({}, d0, { waVia: via }) }); } return x; }   /* V530 · registros viejos: se agrega por dónde verificó */
+  if (auth.admin) { const d0 = x && x.data; if (x && d0 && !d0.wa && (x.type === 'pax-reg' || x.type === 'driver-reg')) { const sv = sibVia(room, x.type === 'pax-reg' ? 'pax' : 'drv', d0); if (sv) return Object.assign({}, x, { data: Object.assign({}, d0, { wa: true, waVia: sv }) }); } if (x && (x.type === 'pax-reg' || x.type === 'driver-reg') && d0 && d0.wa && !d0.waVia) { const via = waViaFor(d0.id, d0.phone); if (via) return Object.assign({}, x, { data: Object.assign({}, d0, { waVia: via }) }); } return x; }   /* V530 · registros viejos: se agrega por dónde verificó */
   const t = x.type, d = x.data;
   if (t === 'seller-reg' || t === 'flex-pkg' || t === 'flex-run' || t === 'flex-cfg') return flexView(room, x, auth);   /* V558 */
   if (t === 'offer-lag') return null;   /* V532 · mediciones de demora: solo las ve el administrador */
