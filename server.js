@@ -345,6 +345,7 @@ function findDupReg(room, type, d) {
     if (!m || m.type !== type) continue;
     const o = m.data; if (!o || typeof o !== 'object' || o.id === d.id || o.hiddenAt || o.deletedAt) continue;
     if (type === 'driver-reg' && !(o.status === 'pendiente' || o.status === 'aprobado')) continue;
+    if (type === 'pax-reg' && !o.wa && !String(o.dni || '').replace(/\D/g, '')) continue;   /* V690 · registro a medio hacer (sin DNI y sin verificar): no bloquea un registro nuevo con el mismo celular (típico de quien se registró dentro de Facebook y cambió de navegador) */
     const same = (t.length >= 8 && tail8(o.phone) === t) || (type === 'pax-reg' && dni.length >= 6 && String(o.dni || '').replace(/\D/g, '') === dni);
     if (same) return o;
   }
