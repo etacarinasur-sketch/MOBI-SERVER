@@ -291,6 +291,25 @@ function regNotify(room, msg) {
   const text = who + '\n' + rows.map((r) => r[0] + ': ' + r[1]).join('\n') + '\nRevisalo en Administración.';
   regMail.chain = regMail.chain.then(() => gmSend(to, '🆕 MOBI · ' + who.replace(/ \(.*/, ''), html, text)).catch((e) => console.log('regNotify', String(e && e.message || e).slice(0, 120)));
 }
+/* V691 · MAIL DE BIENVENIDA · al registrarse un pasajero con mail, se le manda el link de MOBI (todavía no está en Play Store: así no lo pierde).
+   Solo si Gmail está configurado. Un mail por dirección por día, tope diario WELCOME_MAX (200 por defecto), se apaga con WELCOME_MAIL=off. Nunca frena el registro. */
+const welMail = { d: '', n: 0, seen: new Map(), chain: Promise.resolve() };
+function welcomeMail(room, msg) {
+  if (!GM_ON || /^off$/i.test(String(process.env.WELCOME_MAIL || ''))) return;
+  if (/sbx|sandbox|test/i.test(room.name)) return;
+  if (!msg || msg.type !== 'pax-reg' || !msg.data || typeof msg.data !== 'object' || !msg.key) return;
+  if (room.sticky.get('pax-reg|' + msg.key)) return;   /* solo la primera vez que esa cuenta se registra */
+  const d = msg.data, email = String(d.email || '').trim().toLowerCase();
+  if (!okMailAddr(email) || revOn(d.phone)) return;
+  const day = new Date().toISOString().slice(0, 10); if (welMail.d !== day) { welMail.d = day; welMail.n = 0; welMail.seen.clear(); }
+  if (welMail.seen.has(email) || welMail.n >= (Number(process.env.WELCOME_MAX) || 200)) return;
+  welMail.seen.set(email, 1); welMail.n++;
+  const url = String(process.env.APP_URL || 'https://mobi-c6uo.onrender.com').replace(/\/$/, '') + '/';
+  const first = String(d.name || '').trim().split(/\s+/)[0].replace(/[<>&"']/g, '').slice(0, 30);
+  const html = `<div style="background:#eef6f4;padding:24px 12px"><div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:28px 24px;border-radius:18px;background:#06212d;color:#eafff8;text-align:center"><img src="${url}icon-192.png" width="72" height="72" alt="MOBI" style="display:block;margin:0 auto 10px;border-radius:16px"><h2 style="margin:0 0 4px;color:#20e0ad;letter-spacing:3px">MOBI</h2><p style="margin:0 0 16px;color:#9fc3cf;font-size:13px">Tu viaje. Tu camino.</p><p style="margin:0 0 14px">${first ? '¡Hola, ' + first + '! ' : ''}Ya sos parte de MOBI. Guardá este mail: acá tenés el enlace para volver a entrar.</p><a href="${url}" style="display:inline-block;background:#20e0ad;color:#04141f;font-weight:900;font-size:17px;text-decoration:none;padding:14px 28px;border-radius:14px">Abrir MOBI</a><p style="font-size:13px;color:#9fc3cf;margin:18px 0 0;line-height:1.5"><b style="color:#fff">Tip:</b> abrilo en Chrome (o Safari en iPhone) y elegí «Instalar app» / «Agregar a inicio» para tenerlo como una app en tu celular.</p></div></div>`;
+  const text = `${first ? 'Hola, ' + first + '. ' : ''}Ya sos parte de MOBI. Guardá este mail: este es el enlace para volver a entrar: ${url}\nAbrilo en Chrome (o Safari en iPhone) y elegí "Instalar app" / "Agregar a inicio".`;
+  welMail.chain = welMail.chain.then(() => gmSend(email, 'Bienvenido a MOBI · guardá tu enlace', html, text)).catch((e) => console.log('welcomeMail', String(e && e.message || e).slice(0, 120)));
+}
 function pushMessage(room, m) {
   if (!m || typeof m.type !== 'string' || !m.type || m.type.length > 40) return null;
   const msg = {
@@ -313,6 +332,7 @@ function pushMessage(room, m) {
   if (msg.type === 'drv-pres' && msg.data && msg.data.id && msg.data.online !== false) { if (!room.seen) room.seen = new Map(); room.seen.set(String(msg.data.id), Date.now()); }   /* V473 · última vez conectado (para el cupo) */
   try { if (msg.type === 'trip-done') histIngest(room, msg); else if (msg.type === 'drv-pres') presIngest(room, msg); } catch (e) {}
   try { if ((msg.type === 'trip-done' || msg.type === 'trip-end') && welRec.size) welIngest(room, msg); } catch (e) {}   /* V576 · viajes de bienvenida */   /* V485 · historial de conductores (viajes y conexiones) */
+  try { welcomeMail(room, msg); } catch (e) {}   /* V691 · mail de bienvenida al pasajero con el link de MOBI (así no pierde el enlace) */
   try { regNotify(room, msg); } catch (e) {}   /* V538 · aviso por mail al administrador cuando alguien se registra */
   try { supNotify(room, msg); } catch (e) {}   /* V633 · aviso por mail cuando alguien escribe a Soporte */
   if (msg.type === 'trip-done' && room.doneTk && msg.data && msg.data.tripKey) room.doneTk.add(String(msg.data.tripKey));   /* V568 */
