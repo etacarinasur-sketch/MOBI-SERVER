@@ -1629,6 +1629,57 @@ app.post('/api/admin/downloads', (req, res) => {
   res.setHeader('Cache-Control', 'no-store'); res.json({ ok: true, counts: out, serverTime: Date.now() });
 });
 /* V510 · la cuenta del conductor, calculada por el servidor (la misma en la APK y en el navegador) */
+/* V686 · ficha pública GLOBAL de conductor / pasajero: calificaciones, antigüedad, foto y viajes calculados por el SERVIDOR (iguales en todos los celulares) */
+const profIdx = new Map();
+const normPl = (s) => String(s || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+const nameKey = (s) => { const p = String(s || '').trim().toLowerCase().split(/\s+/).filter(Boolean); return p.length ? (p[0] + ' ' + (p[1] ? p[1][0] : '')).trim() : ''; };
+const shortName = (s) => { const p = String(s || '').trim().split(/\s+/).filter(Boolean); return p.length ? (p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '')) : ''; };
+function profIndex(room) {
+  const hit = profIdx.get(room.name); if (hit && Date.now() - hit.t < 15000) return hit.d;
+  const d = { drv: new Map(), pax: new Map(), rat: new Map(), trips: new Map(), tripDrv: new Map(), seen: new Set() };
+  const add = (m, k, v) => { let a = m.get(k); if (!a) m.set(k, (a = [])); a.push(v); };
+  for (const x of room.sticky.values()) {
+    if (!x || !x.data || typeof x.data !== 'object') continue; const t = x.type, v = x.data;
+    if (t === 'driver-reg' && v.id && !v.deletedAt) d.drv.set(String(v.id), v);
+    else if (t === 'pax-reg' && v.id) d.pax.set(String(v.id), v);
+    else if (t === 'trip-done' && v.sum) {
+      const sm = v.sum, tk = String(v.tripKey || sm.tripKey || sm.tripId || ''); if (!tk || d.seen.has(tk)) continue; d.seen.add(tk);
+      const dr = String(sm.driverId || ''), px = String(sm.paxId || ''), pl = normPl(sm.driver && sm.driver.plate);
+      if (dr) add(d.trips, 'drv|' + dr, tk); if (pl) add(d.trips, 'drvpl|' + pl, tk); if (px) add(d.trips, 'pax|' + px, tk);
+      if (sm.tripId && pl) d.tripDrv.set(String(sm.tripId), pl);
+    }
+  }
+  let i = 0;
+  for (const x of room.sticky.values()) {
+    if (!x || x.type !== 'rating' || !x.data) continue; const v = x.data, s = Number(v.stars); if (!(s >= 1 && s <= 5)) continue; i++;
+    if (v.toId) add(d.rat, String(v.to) + '|' + v.toId, [i, s]);
+    const pl = v.to === 'drv' && v.tripId && d.tripDrv.get(String(v.tripId)); if (pl) add(d.rat, 'drvpl|' + pl, [i, s]);
+  }
+  profIdx.set(room.name, { t: Date.now(), d }); return d;
+}
+async function docGetOne(owner, kind) {   /* solo UNA foto (la de perfil), nunca los documentos */
+  const id = owner + '|' + kind, m = docMem.get(id); if (m && m.img) return m.img;
+  if (db) { try { const r = await db.query(`SELECT data FROM mobi_kv WHERE ns = 'doc' AND id = $1`, [id]); if (r.rows[0] && r.rows[0].data) return r.rows[0].data.img || ''; } catch (e) {} }
+  return '';
+}
+app.post('/api/profile/card', async (req, res) => {
+  const b = req.body || {}, room = getRoom(b.room), au = authOf(req, room.name);
+  if (!au.sk && !au.admin) return res.status(401).json({ ok: false, error: 'sesion' });
+  const role = b.role === 'pax' ? 'pax' : 'drv', d = profIndex(room), reg = role === 'drv' ? d.drv : d.pax;
+  const id = String(b.id || '').slice(0, 40), plate = normPl(b.plate), nk = nameKey(b.name);
+  let rec = (id && reg.get(id)) || null;
+  if (!rec && role === 'drv' && plate) for (const v of reg.values()) if (normPl(v.plate) === plate) { rec = v; break; }
+  if (!rec && nk) { const m = []; for (const v of reg.values()) if (nameKey(v.name) === nk) m.push(v); if (m.length === 1) rec = m[0]; }
+  const rid = rec ? String(rec.id) : id, rpl = role === 'drv' ? normPl((rec && rec.plate) || plate) : '';
+  const rs = new Map(); [d.rat.get(role + '|' + rid), rpl && d.rat.get('drvpl|' + rpl)].forEach((l) => (l || []).forEach((r) => rs.set(r[0], r[1])));
+  const ts = new Set(); [d.trips.get(role + '|' + rid), rpl && d.trips.get('drvpl|' + rpl)].forEach((l) => (l || []).forEach((k) => ts.add(k)));
+  let sum = 0, good = 0; rs.forEach((s) => { sum += s; if (s >= 4) good++; });
+  let ph = rec && typeof rec.photo === 'string' ? rec.photo : '';
+  if (!ph && role === 'drv' && rec) ph = await docGetOne(String(rec.id), 'profile');   /* la foto del conductor vive en el almacén de documentos */
+  if (!(/^data:image\//.test(ph) && ph.length < 700000)) ph = '';
+  const since = rec ? Number(role === 'drv' ? (rec.registeredAt || rec.submittedAt || rec.approvedAt) : (rec.at || rec.upd)) || 0 : 0;
+  res.json({ ok: true, found: !!rec, role, name: rec ? shortName(rec.name) : '', plate: rec && role === 'drv' ? String(rec.plate || '') : '', vehicle: rec && role === 'drv' ? String(rec.vehicle || '') : '', since, photo: ph, rating: { count: rs.size, avg: rs.size ? Math.round(sum / rs.size * 10) / 10 : 0, good }, trips: ts.size });
+});
 app.post('/api/debt/me', (req, res) => {
   const b = req.body || {}, r = getRoom(b.room), drv = String(b.driver || ''), au = authOf(req, r.name);
   if (!OWN_RE.drv.test(drv)) return res.status(400).json({ ok: false, error: 'datos' });
