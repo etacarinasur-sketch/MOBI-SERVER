@@ -508,7 +508,7 @@ function ledgerOf(room, drv) {
       if (y.type === 'charge') L.charges += a;
       else if (y.type === 'credit') {
         if (y.hold || y.ver === false) { L.held += a; continue; }
-        /* V660 · cobro con tarjeta todavía no liberado por Mercado Pago: NO entra a la cuenta (ni baja deuda ni suma saldo) hasta que se libere; recién ahí se descuenta de la deuda o queda a favor para retiro */
+        /* V686 · cobro con tarjeta todavía no liberado por Mercado Pago: NO entra a la cuenta (ni baja deuda ni suma saldo) hasta que se libere; recién ahí se descuenta de la deuda o queda a favor para retiro */
         if (MP_RELEASE_DAYS > 0 && isCardCredit(y)) { const mo = y.mpOrd && mpOrders.get(String(y.mpOrd)), t0 = Number((mo && mo.at) || y.paidAt || y.at || 0), rel = t0 + MP_RELEASE_DAYS * 86400_000;
           if (rel > now) { L.unrel += a; if (!L.nextRel || rel < L.nextRel) L.nextRel = rel; if (y.id) L.relMap[String(y.id)] = rel; continue; } }
         L.cred += a; if (isCancelCredit(y) || y.kind === 'welcome') L.cancelCr += a;   /* V576 · saldo de viajes de bienvenida: descuenta deuda/comisiones, no se retira */
@@ -520,7 +520,7 @@ function ledgerOf(room, drv) {
   const netv = L.charges - L.paid - L.cred + L.payDone, favor = Math.max(0, -netv);
   const cancelLeft = Math.max(0, L.cancelCr - Math.max(0, L.charges - L.paid));   /* lo acreditado por cancelaciones solo baja deuda: no se retira */
   L.debt = r2(Math.max(0, netv)); L.favor = r2(favor);
-  L.avail = r2(Math.max(0, Math.max(0, favor - cancelLeft) - L.payPend));   /* V660 · lo no liberado ya no está en 'favor' */
+  L.avail = r2(Math.max(0, Math.max(0, favor - cancelLeft) - L.payPend));   /* V686 · lo no liberado ya no está en 'favor' */
   L.unrel = r2(L.unrel);
   L.held = r2(L.held);
   L.list.sort((p, q) => Number(p.at || 0) - Number(q.at || 0));
