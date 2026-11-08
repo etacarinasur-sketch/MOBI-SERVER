@@ -1635,8 +1635,8 @@ const normPl = (s) => String(s || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
 const nameKey = (s) => { const p = String(s || '').trim().toLowerCase().split(/\s+/).filter(Boolean); return p.length ? (p[0] + ' ' + (p[1] ? p[1][0] : '')).trim() : ''; };
 const shortName = (s) => { const p = String(s || '').trim().split(/\s+/).filter(Boolean); return p.length ? (p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '')) : ''; };
 function profIndex(room) {
-  const hit = profIdx.get(room.name); if (hit && Date.now() - hit.t < 15000) return hit.d;
-  const d = { drv: new Map(), pax: new Map(), rat: new Map(), trips: new Map(), tripDrv: new Map(), seen: new Set() };
+  const hit = profIdx.get(room.name); if (hit && Date.now() - hit.t < 5000) return hit.d;
+  const d = { drv: new Map(), pax: new Map(), rat: new Map(), trips: new Map(), tripDrv: new Map(), tripPax: new Map(), seen: new Set() };
   const add = (m, k, v) => { let a = m.get(k); if (!a) m.set(k, (a = [])); a.push(v); };
   for (const x of room.sticky.values()) {
     if (!x || !x.data || typeof x.data !== 'object') continue; const t = x.type, v = x.data;
@@ -1644,16 +1644,19 @@ function profIndex(room) {
     else if (t === 'pax-reg' && v.id) d.pax.set(String(v.id), v);
     else if (t === 'trip-done' && v.sum) {
       const sm = v.sum, tk = String(v.tripKey || sm.tripKey || sm.tripId || ''); if (!tk || d.seen.has(tk)) continue; d.seen.add(tk);
-      const dr = String(sm.driverId || ''), px = String(sm.paxId || ''), pl = normPl(sm.driver && sm.driver.plate);
-      if (dr) add(d.trips, 'drv|' + dr, tk); if (pl) add(d.trips, 'drvpl|' + pl, tk); if (px) add(d.trips, 'pax|' + px, tk);
+      const dr = String(sm.driverId || ''), pl = normPl(sm.driver && sm.driver.plate);
+      const pk = paxIdentOfTrip(room, String(v.tripKey || sm.tripKey || '')), pid = /^pax:/.test(pk) ? pk.slice(4) : String(sm.paxId || '');   /* el pasajero real lo sabe el SERVIDOR (quién pidió el viaje); el id del resumen puede ser del celular que lo cerró */
+      if (pl) add(d.trips, 'drvpl|' + pl, tk); else if (dr) add(d.trips, 'drv|' + dr, tk);
+      if (pid) add(d.trips, 'pax|' + pid, tk);
       if (sm.tripId && pl) d.tripDrv.set(String(sm.tripId), pl);
+      if (sm.tripId && pid) d.tripPax.set(String(sm.tripId), pid);
     }
   }
   let i = 0;
   for (const x of room.sticky.values()) {
     if (!x || x.type !== 'rating' || !x.data) continue; const v = x.data, s = Number(v.stars); if (!(s >= 1 && s <= 5)) continue; i++;
-    if (v.toId) add(d.rat, String(v.to) + '|' + v.toId, [i, s]);
-    const pl = v.to === 'drv' && v.tripId && d.tripDrv.get(String(v.tripId)); if (pl) add(d.rat, 'drvpl|' + pl, [i, s]);
+    const tid = String(v.tripId || ''), pl = v.to === 'drv' && tid && d.tripDrv.get(tid), pp = v.to === 'pax' && tid && d.tripPax.get(tid);
+    if (pl) add(d.rat, 'drvpl|' + pl, [i, s]); else if (pp) add(d.rat, 'pax|' + pp, [i, s]); else if (v.toId) add(d.rat, String(v.to) + '|' + v.toId, [i, s]);   /* primero lo que dice el viaje; el id de la calificación solo si el viaje no se conoce */
   }
   profIdx.set(room.name, { t: Date.now(), d }); return d;
 }
