@@ -1636,7 +1636,7 @@ const nameKey = (s) => { const p = String(s || '').trim().toLowerCase().split(/\
 const shortName = (s) => { const p = String(s || '').trim().split(/\s+/).filter(Boolean); return p.length ? (p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '')) : ''; };
 function profIndex(room) {
   const hit = profIdx.get(room.name); if (hit && Date.now() - hit.t < 5000) return hit.d;
-  const d = { drv: new Map(), pax: new Map(), rat: new Map(), trips: new Map(), tripDrv: new Map(), tripPax: new Map(), seen: new Set() };
+  const d = { drv: new Map(), pax: new Map(), rat: new Map(), trips: new Map(), tripDrv: new Map(), tripPax: new Map(), recent: [], seen: new Set() };
   const add = (m, k, v) => { let a = m.get(k); if (!a) m.set(k, (a = [])); a.push(v); };
   for (const x of room.sticky.values()) {
     if (!x || !x.data || typeof x.data !== 'object') continue; const t = x.type, v = x.data;
@@ -1650,6 +1650,7 @@ function profIndex(room) {
       if (pid) add(d.trips, 'pax|' + pid, tk);
       if (sm.tripId && pl) d.tripDrv.set(String(sm.tripId), pl);
       if (sm.tripId && pid) d.tripPax.set(String(sm.tripId), pid);
+      if (pl && Number(x.at) > Date.now() - 7 * 86400000) d.recent.push({ pk, pl, at: Number(x.at) });   /* V687 · viajes de los últimos días: para habilitar el contacto con el chofer */
     }
   }
   let i = 0;
@@ -1681,7 +1682,44 @@ app.post('/api/profile/card', async (req, res) => {
   if (!ph && role === 'drv' && rec) ph = await docGetOne(String(rec.id), 'profile');   /* la foto del conductor vive en el almacén de documentos */
   if (!(/^data:image\//.test(ph) && ph.length < 700000)) ph = '';
   const since = rec ? Number(role === 'drv' ? (rec.registeredAt || rec.submittedAt || rec.approvedAt) : (rec.at || rec.upd)) || 0 : 0;
-  res.json({ ok: true, found: !!rec, role, name: rec ? shortName(rec.name) : '', plate: rec && role === 'drv' ? String(rec.plate || '') : '', vehicle: rec && role === 'drv' ? String(rec.vehicle || '') : '', since, photo: ph, rating: { count: rs.size, avg: rs.size ? Math.round(sum / rs.size * 10) / 10 : 0, good }, trips: ts.size });
+  /* V687 · «perdí algo en el auto»: el celular del conductor se entrega SOLO al pasajero que viajó con él, hasta 72 h después del viaje */
+  let phone = '', contactUntil = 0;
+  if (role === 'drv' && rec && rpl && au.sk) {
+    const me = paxIdentOfSk(room, au.sk), hit = me && d.recent.filter((t) => t.pk === me && t.pl === rpl).sort((p, q) => q.at - p.at)[0];
+    if (hit && Date.now() - hit.at < 72 * 3600000) { phone = String(rec.phone || '').replace(/[^\d+]/g, '').slice(0, 20); contactUntil = hit.at + 72 * 3600000; }
+  }
+  const acc = au.admin && role === 'drv' && rec ? await kvLoadOne('accstat', room.name + '|' + rec.id) : null;
+  res.json({ ok: true, found: !!rec, role, name: rec ? shortName(rec.name) : '', plate: rec && role === 'drv' ? String(rec.plate || '') : '', vehicle: rec && role === 'drv' ? String(rec.vehicle || '') : '', since, photo: ph, rating: { count: rs.size, avg: rs.size ? Math.round(sum / rs.size * 10) / 10 : 0, good }, trips: ts.size, phone, contactUntil, accept: acc ? { offered: acc.o, accepted: acc.a, rate: acc.o ? Math.round(acc.a * 100 / acc.o) : null } : undefined });
+});
+/* V687 · datos propios de cada cuenta guardados en el SERVIDOR (no solo en el celular): medio de pago preferido, alias/CBU de devolución y tasa de aceptación del conductor */
+const kvOneMem = new Map();
+async function kvLoadOne(ns, key) {
+  const mk = ns + '|' + key; if (kvOneMem.has(mk)) return kvOneMem.get(mk);
+  let v = null; if (db) { try { const r = await db.query(`SELECT data FROM mobi_kv WHERE ns = $1 AND id = $2`, [ns, key]); v = (r.rows[0] && r.rows[0].data) || null; } catch (e) {} }
+  if (v) kvOneMem.set(mk, v); return v;
+}
+function kvSaveOne(ns, key, v) { kvOneMem.set(ns + '|' + key, v); kvSet(ns, key, v); }
+app.post('/api/my/prefs', async (req, res) => {
+  const b = req.body || {}, r = getRoom(b.room), role = b.role === 'drv' ? 'drv' : 'pax', id = String(b.id || ''), au = authOf(req, r.name);
+  if (!OWN_RE[role].test(id)) return res.status(400).json({ ok: false, error: 'datos' });
+  if (!au.admin && !ownHas(r, role, id, au.sk)) return res.status(403).json({ ok: false, error: 'forbidden' });
+  const key = r.name + '|' + role + '|' + id; let cur = (await kvLoadOne('prefs', key)) || {};
+  if (b.set && typeof b.set === 'object') {
+    const n = Object.assign({}, cur);
+    if (typeof b.set.payPref === 'string') n.payPref = b.set.payPref.slice(0, 30);
+    if (typeof b.set.cbu === 'string') n.cbu = b.set.cbu.replace(/[^\w .@-]/g, '').slice(0, 60);
+    n.at = Date.now(); kvSaveOne('prefs', key, n); cur = n;
+  }
+  res.json({ ok: true, payPref: cur.payPref || '', cbu: cur.cbu || '' });
+});
+app.post('/api/drv/accept-stat', async (req, res) => {
+  const b = req.body || {}, r = getRoom(b.room), id = String(b.driver || ''), au = authOf(req, r.name);
+  if (!OWN_RE.drv.test(id)) return res.status(400).json({ ok: false, error: 'datos' });
+  if (!au.admin && !ownHas(r, 'drv', id, au.sk)) return res.status(403).json({ ok: false, error: 'forbidden' });
+  const key = r.name + '|' + id; let cur = (await kvLoadOne('accstat', key)) || { o: 0, a: 0 };
+  const o = Math.max(0, Math.min(1000, Math.round(Number(b.offered)))), a = Math.max(0, Math.min(o, Math.round(Number(b.accepted))));
+  if (Number.isFinite(o) && Number.isFinite(a) && b.offered !== undefined) { cur = { o, a, at: Date.now() }; kvSaveOne('accstat', key, cur); }
+  res.json({ ok: true, offered: cur.o || 0, accepted: cur.a || 0, rate: cur.o ? Math.round(cur.a * 100 / cur.o) : null });
 });
 app.post('/api/debt/me', (req, res) => {
   const b = req.body || {}, r = getRoom(b.room), drv = String(b.driver || ''), au = authOf(req, r.name);
